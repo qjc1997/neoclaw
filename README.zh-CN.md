@@ -34,6 +34,8 @@
 
 ## ✨ 功能特性
 
+- **完整 Claude Code 支持**: 由世界上最强大的 Agent 驱动，完美支持 Claude Code 的一切能力（包括 Plugins、Skills、MCPs 等），提供最强大的 AI 协作体验。
+
 - **多场景支持**: 完美适配私聊、群聊、话题群等多种飞书场景。
   - **群聊支持**: 在群聊中 @NeoClaw 即可唤起回复。
     <br/><img src="imgs/demo/group.png" width="300" alt="Group Chat" />

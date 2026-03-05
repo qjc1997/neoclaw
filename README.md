@@ -34,6 +34,8 @@
 
 ## ✨ Features
 
+- **Full Claude Code Support**: Powered by the world's most powerful Agent, seamlessly supporting everything from Claude Code (including Plugins, Skills, MCPs, etc.), delivering the most powerful AI capabilities.
+
 - **Multi-Scenario Support**: Perfectly adapts to various Feishu scenarios such as private chats, group chats, and topic groups.
   - **Group Chat Support**: Mention @NeoClaw in group chats to trigger a reply.
     <br/><img src="imgs/demo/group.png" width="300" alt="Group Chat" />
