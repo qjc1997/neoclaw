@@ -1,0 +1,628 @@
+/**
+ * ClaudeCodeAgent — Claude Code CLI agent using JSONL streaming protocol.
+ *
+ * Each conversation gets a dedicated long-running claude CLI subprocess.
+ * Messages are sent as JSONL on stdin and responses are streamed back on stdout.
+ *
+ * Supports custom tool registration.
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import type { FileSink, Subprocess } from 'bun';
+import type {
+  Agent,
+  AgentStreamEvent,
+  AskQuestion,
+  Attachment,
+  RunRequest,
+  RunResponse,
+} from './types.js';
+import { logger } from '../utils/logger.js';
+
+const log = logger('claude-code');
+
+// ── JSONL protocol types ──────────────────────────────────────
+
+// Messages sent to Claude CLI on stdin
+type TextBlock = { type: 'text'; text: string };
+type ImageBlock = {
+  type: 'image';
+  source: { type: 'base64'; media_type: string; data: string };
+};
+type UserInput = {
+  type: 'user';
+  message: { role: 'user'; content: string | Array<TextBlock | ImageBlock> };
+};
+
+/** Detect image MIME type from buffer magic bytes; defaults to image/jpeg. */
+function detectImageMime(buf: Buffer): string {
+  if (buf.length >= 4) {
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+      return 'image/png';
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
+    if (
+      buf.length >= 12 &&
+      buf[0] === 0x52 &&
+      buf[1] === 0x49 &&
+      buf[2] === 0x46 &&
+      buf[3] === 0x46 &&
+      buf[8] === 0x57 &&
+      buf[9] === 0x45 &&
+      buf[10] === 0x42 &&
+      buf[11] === 0x50
+    )
+      return 'image/webp';
+  }
+  return 'image/jpeg';
+}
+
+/** Build the content payload for a user turn, embedding image attachments when present. */
+function buildUserContent(
+  text: string,
+  attachments?: Attachment[]
+): string | Array<TextBlock | ImageBlock> {
+  const images = attachments?.filter((a) => a.mediaType === 'image') ?? [];
+  if (images.length === 0) return text;
+
+  const blocks: Array<TextBlock | ImageBlock> = [{ type: 'text', text }];
+  for (const img of images) {
+    blocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: detectImageMime(img.buffer),
+        data: img.buffer.toString('base64'),
+      },
+    });
+  }
+  return blocks;
+}
+
+// Messages received from Claude CLI on stdout
+type InitEvent = {
+  type: 'system';
+  subtype: 'init';
+  session_id: string;
+  model: string;
+};
+type ContentBlockStartEvent = {
+  type: 'content_block_start';
+  content_block: { type: string; id?: string; name?: string; input?: Record<string, unknown> };
+};
+type ContentBlockDeltaEvent = {
+  type: 'content_block_delta';
+  index: number;
+  delta:
+    | { type: 'text_delta'; text: string }
+    | { type: 'thinking_delta'; thinking: string }
+    | { type: 'input_json_delta'; partial_json: string };
+};
+type ContentBlockStopEvent = { type: 'content_block_stop'; index: number };
+type PermissionDenial = {
+  tool_name: string;
+  tool_use_id: string;
+  tool_input: unknown;
+};
+
+type ResultEvent = {
+  type: 'result';
+  result: string;
+  session_id: string;
+  cost_usd: number | null;
+  model: string;
+  is_error: boolean;
+  duration_ms: number | null;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  permission_denials?: PermissionDenial[];
+};
+
+/** Extract AskUserQuestion tool inputs from permission_denials. Returns null if none. */
+function extractAskQuestions(resultEvt: ResultEvent): AskQuestion[] | null {
+  const denials = resultEvt.permission_denials?.filter((d) => d.tool_name === 'AskUserQuestion');
+  if (!denials || denials.length === 0) return null;
+
+  const questions: AskQuestion[] = [];
+  for (const denial of denials) {
+    const input = denial.tool_input as { questions?: AskQuestion[] };
+    for (const q of input.questions ?? []) {
+      questions.push(q);
+    }
+  }
+  return questions.length > 0 ? questions : null;
+}
+
+/** Format AskQuestion list as plain markdown text (fallback for non-streaming run()). */
+function formatQuestionsAsText(questions: AskQuestion[]): string {
+  const lines: string[] = [];
+  for (const q of questions) {
+    lines.push(`**${q.question}**`);
+    q.options.forEach((opt, i) => {
+      lines.push(`${i + 1}. **${opt.label}**${opt.description ? `: ${opt.description}` : ''}`);
+    });
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+type CueEvent =
+  | InitEvent
+  | ContentBlockStartEvent
+  | ContentBlockDeltaEvent
+  | ContentBlockStopEvent
+  | ResultEvent;
+
+function parseCliEvent(line: string): CueEvent | null {
+  try {
+    return JSON.parse(line) as CueEvent;
+  } catch {
+    return null;
+  }
+}
+
+// ── Mutex for serializing stdin writes ───────────────────────
+
+class Mutex {
+  private _waiters: Array<() => void> = [];
+  private _held = false;
+
+  async lock(): Promise<void> {
+    if (!this._held) {
+      this._held = true;
+      return;
+    }
+    return new Promise<void>((resolve) => this._waiters.push(resolve));
+  }
+
+  unlock(): void {
+    const next = this._waiters.shift();
+    if (next) {
+      next();
+    } else {
+      this._held = false;
+    }
+  }
+}
+
+// ── ClaudeProcess: manages one long-running claude subprocess ──
+
+class ClaudeProcess {
+  private _proc: Subprocess | null = null;
+  private _sessionId: string | null = null;
+  private _mutex = new Mutex();
+  private _reader: ReadableStreamDefaultReader<string> | null = null;
+  private _buffer = '';
+
+  constructor(
+    private readonly opts: {
+      model?: string | null;
+      allowedTools?: string[];
+      systemPrompt?: string | null;
+      cwd?: string | null;
+      resumeSessionId?: string | null;
+      extraEnv?: Record<string, string>;
+    }
+  ) {}
+
+  get isRunning(): boolean {
+    return this._proc !== null && !this._proc.killed;
+  }
+
+  get sessionId(): string | null {
+    return this._sessionId;
+  }
+
+  private _buildArgs(): string[] {
+    const args = [
+      'claude',
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+    ];
+    if (this.opts.resumeSessionId) args.push('--resume', this.opts.resumeSessionId);
+    if (this.opts.model) args.push('--model', this.opts.model);
+    if (this.opts.allowedTools && this.opts.allowedTools.length > 0) {
+      args.push('--allowedTools', this.opts.allowedTools.join(','));
+    } else {
+      args.push('--dangerously-skip-permissions');
+    }
+    // Always append the AskUserQuestion hint so the model doesn't mention
+    // "tool denied" errors — the gateway captures the questions from
+    // permission_denials and presents them to the user via an interactive form.
+    const askUserHint =
+      '## AskUserQuestion Gateway Integration\nWhen you use the AskUserQuestion tool and it is denied, the gateway has already captured your questions and will present them to the user via an interactive form. Do not mention any errors or denied tools — the questions have been delivered successfully. Simply tell the user you have some questions for them and wait for their response.\n\nIMPORTANT: Always set multiSelect to false. The gateway only supports single-select dropdowns — never use multi-select questions.';
+    const systemPrompt = this.opts.systemPrompt
+      ? `${this.opts.systemPrompt}\n\n${askUserHint}`
+      : askUserHint;
+    args.push('--append-system-prompt', systemPrompt);
+    return args;
+  }
+
+  async start(): Promise<void> {
+    if (this.isRunning) throw new Error('Process already running');
+
+    // Strip Claude Code env vars to prevent nested invocations from inheriting them
+    const env = { ...process.env, ...this.opts.extraEnv };
+    delete env['CLAUDECODE'];
+    delete env['CLAUDE_CODE_ENTRYPOINT'];
+
+    this._proc = Bun.spawn(this._buildArgs(), {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      cwd: this.opts.cwd ?? undefined,
+      env,
+    });
+
+    const decoder = new TextDecoderStream();
+    (this._proc.stdout as ReadableStream<Uint8Array>)
+      .pipeTo(decoder.writable as WritableStream<Uint8Array>)
+      .catch(() => {});
+    this._reader = decoder.readable.getReader() as ReadableStreamDefaultReader<string>;
+    this._buffer = '';
+  }
+
+  /**
+   * Send a user message (with optional image attachments) and yield parsed CLI
+   * events until the result arrives.
+   */
+  async *exchange(text: string, attachments?: Attachment[]): AsyncGenerator<CueEvent> {
+    await this._mutex.lock();
+    try {
+      if (!this.isRunning) throw new Error('Process is not running');
+
+      const content = buildUserContent(text, attachments);
+      await this._writeln(
+        JSON.stringify({ type: 'user', message: { role: 'user', content } } as UserInput)
+      );
+
+      while (true) {
+        const line = await this._readLine();
+        if (line === null) break;
+
+        const evt = parseCliEvent(line);
+        if (!evt) continue;
+
+        // Capture session ID from init event
+        if (evt.type === 'system' && (evt as InitEvent).subtype === 'init') {
+          this._sessionId = (evt as InitEvent).session_id;
+          continue;
+        }
+
+        if (evt.type === 'result') {
+          const r = evt as ResultEvent;
+          if (r.session_id) this._sessionId = r.session_id;
+          yield evt;
+          return;
+        }
+
+        yield evt;
+      }
+    } finally {
+      this._mutex.unlock();
+    }
+  }
+
+  async terminate(): Promise<void> {
+    if (!this._proc) return;
+
+    if (this._reader) {
+      this._reader.cancel().catch(() => {});
+      this._reader = null;
+    }
+
+    if (this.isRunning) {
+      try {
+        (this._proc.stdin as FileSink).end();
+        const done = this._proc.exited;
+        const timeout = new Promise<void>((resolve) => setTimeout(resolve, 5000));
+        await Promise.race([done, timeout]);
+      } catch {
+        // ignore
+      }
+      if (!this._proc.killed) {
+        this._proc.kill();
+        try {
+          await this._proc.exited;
+        } catch {
+          // process may have already exited
+        }
+      }
+    }
+    this._proc = null;
+  }
+
+  // ── I/O helpers ───────────────────────────────────────────
+
+  private async _writeln(data: string): Promise<void> {
+    const stdin = this._proc?.stdin as FileSink | undefined;
+    if (!stdin) throw new Error('Process stdin not available');
+    stdin.write(data + '\n');
+    await stdin.flush();
+  }
+
+  private async _readLine(): Promise<string | null> {
+    if (!this._reader) return null;
+    try {
+      while (true) {
+        const nl = this._buffer.indexOf('\n');
+        if (nl !== -1) {
+          const line = this._buffer.slice(0, nl).trim();
+          this._buffer = this._buffer.slice(nl + 1);
+          if (line) return line;
+          continue;
+        }
+        const { value, done } = await this._reader.read();
+        if (done) return null;
+        this._buffer += value;
+      }
+    } catch {
+      return null;
+    }
+  }
+}
+
+// ── ClaudeCodeAgent ───────────────────────────────────────────
+
+const IDLE_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
+const CLEANUP_INTERVAL_MS = 60 * 1000; // 1 min
+const SESSIONS_PATH = join(homedir(), '.neoclaw', 'cache', 'sessions.json');
+
+export class ClaudeCodeAgent implements Agent {
+  readonly kind = 'claude_code';
+
+  private _pool = new Map<string, ClaudeProcess>();
+  private _lastUsed = new Map<string, number>();
+  /** Persists session IDs so processes can be resumed after idle reap or daemon restart. */
+  private _sessionIds = new Map<string, string>();
+  private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private _sessionFlushPending = false;
+
+  constructor(
+    private readonly opts: {
+      model?: string | null;
+      allowedTools?: string[];
+      systemPrompt?: string | null;
+      cwd?: string | null;
+    } = {}
+  ) {
+    this._loadSessions();
+  }
+
+  // ── Agent interface ───────────────────────────────────────
+
+  async run(request: RunRequest): Promise<RunResponse> {
+    log.info(`Run request: ${JSON.stringify(request)}`);
+    const t0 = Date.now();
+    const textParts: string[] = [];
+    const thinkingParts: string[] = [];
+    let resultEvt: ResultEvent | null = null;
+
+    for await (const evt of this._streamInternal(request)) {
+      if (evt.type === 'content_block_delta') {
+        const delta = (evt as ContentBlockDeltaEvent).delta;
+        if (delta.type === 'text_delta') textParts.push(delta.text);
+        else if (delta.type === 'thinking_delta') thinkingParts.push(delta.thinking);
+      } else if (evt.type === 'result') {
+        resultEvt = evt as ResultEvent;
+      }
+    }
+
+    const baseText = resultEvt?.result || textParts.join('');
+    const askQuestions = resultEvt ? extractAskQuestions(resultEvt) : null;
+    // Non-streaming fallback: append questions as plain text
+    const text = askQuestions ? `${formatQuestionsAsText(askQuestions)}\n\n${baseText}` : baseText;
+    const thinking = thinkingParts.length > 0 ? thinkingParts.join('') : null;
+
+    // Persist session ID so the process can be resumed if it gets reaped while idle
+    if (resultEvt?.session_id) {
+      this._sessionIds.set(request.conversationId, resultEvt.session_id);
+      this._flushSessions();
+    }
+
+    return {
+      text,
+      thinking,
+      sessionId: resultEvt?.session_id ?? null,
+      costUsd: resultEvt?.cost_usd ?? null,
+      inputTokens: resultEvt?.usage?.input_tokens ?? null,
+      outputTokens: resultEvt?.usage?.output_tokens ?? null,
+      elapsedMs: Date.now() - t0,
+      model: resultEvt?.model ?? null,
+    };
+  }
+
+  async *stream(request: RunRequest): AsyncGenerator<AgentStreamEvent> {
+    const t0 = Date.now();
+    const textParts: string[] = [];
+    const thinkingParts: string[] = [];
+    let resultEvt: ResultEvent | null = null;
+
+    for await (const evt of this._streamInternal(request)) {
+      if (evt.type === 'content_block_delta') {
+        const delta = (evt as ContentBlockDeltaEvent).delta;
+        if (delta.type === 'text_delta') {
+          textParts.push(delta.text);
+          yield { type: 'text_delta', text: delta.text };
+        } else if (delta.type === 'thinking_delta') {
+          thinkingParts.push(delta.thinking);
+          yield { type: 'thinking_delta', text: delta.thinking };
+        }
+      } else if (evt.type === 'result') {
+        resultEvt = evt as ResultEvent;
+      }
+    }
+
+    if (resultEvt?.session_id) {
+      this._sessionIds.set(request.conversationId, resultEvt.session_id);
+      this._flushSessions();
+    }
+
+    const baseText = resultEvt?.result || textParts.join('');
+    const askQuestions = resultEvt ? extractAskQuestions(resultEvt) : null;
+    // Yield ask_questions BEFORE done so the streaming card is still open when the gateway appends the form
+    if (askQuestions && askQuestions.length > 0) {
+      yield {
+        type: 'ask_questions',
+        questions: askQuestions,
+        conversationId: request.conversationId,
+      };
+    }
+    const text = baseText;
+    const thinking = thinkingParts.length > 0 ? thinkingParts.join('') : null;
+
+    log.info(`Run done: ${JSON.stringify({ text, thinking, resultEvt })}`);
+
+    yield {
+      type: 'done',
+      response: {
+        text,
+        thinking,
+        sessionId: resultEvt?.session_id ?? null,
+        costUsd: resultEvt?.cost_usd ?? null,
+        inputTokens: resultEvt?.usage?.input_tokens ?? null,
+        outputTokens: resultEvt?.usage?.output_tokens ?? null,
+        elapsedMs: Date.now() - t0,
+        model: resultEvt?.model ?? null,
+      },
+    };
+  }
+
+  async healthCheck(): Promise<boolean> {
+    try {
+      const result = Bun.spawnSync(['claude', '--version'], { stdout: 'pipe', stderr: 'pipe' });
+      return result.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async clearConversation(conversationId: string): Promise<void> {
+    const proc = this._pool.get(conversationId);
+    if (proc) {
+      await proc.terminate();
+      this._pool.delete(conversationId);
+      this._lastUsed.delete(conversationId);
+    }
+    this._sessionIds.delete(conversationId);
+    this._flushSessions();
+    log.info(`Conversation cleared: "${conversationId}"`);
+  }
+
+  async dispose(): Promise<void> {
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
+    await Promise.all([...this._pool.values()].map((p) => p.terminate()));
+    this._pool.clear();
+    this._lastUsed.clear();
+    // Clear _sessionIds in memory but do NOT flush — the persisted file is kept
+    // intact so the next daemon process can resume sessions after a restart.
+    this._sessionIds.clear();
+    log.info('Agent disposed');
+  }
+
+  // ── Session persistence ───────────────────────────────────
+
+  private _loadSessions(): void {
+    try {
+      if (!existsSync(SESSIONS_PATH)) return;
+      const data = JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8')) as Record<string, string>;
+      for (const [id, sid] of Object.entries(data)) {
+        this._sessionIds.set(id, sid);
+      }
+      log.info(`Loaded ${this._sessionIds.size} session(s) from ${SESSIONS_PATH}`);
+    } catch {
+      // Non-critical — start with empty session map
+    }
+  }
+
+  private _flushSessions(): void {
+    if (this._sessionFlushPending) return;
+    this._sessionFlushPending = true;
+    setTimeout(() => {
+      this._sessionFlushPending = false;
+      try {
+        const dir = join(homedir(), '.neoclaw', 'cache');
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        const data: Record<string, string> = Object.fromEntries(this._sessionIds);
+        writeFileSync(SESSIONS_PATH, JSON.stringify(data, null, 2));
+      } catch (err) {
+        log.warn(`Failed to flush sessions: ${err}`);
+      }
+    }, 2000);
+  }
+
+  // ── Internals ─────────────────────────────────────────────
+
+  private async *_streamInternal(request: RunRequest): AsyncGenerator<CueEvent> {
+    const proc = await this._getOrCreate(request);
+    yield* proc.exchange(request.text, request.attachments);
+  }
+
+  private _conversationCwd(conversationId: string): string | null {
+    if (!this.opts.cwd) return null;
+    // Sanitize conversationId for use as a directory name (replace ':' with '_')
+    const dirName = conversationId.replace(/:/g, '_');
+    const cwd = join(this.opts.cwd, dirName);
+    mkdirSync(cwd, { recursive: true });
+    return cwd;
+  }
+
+  private async _getOrCreate(request: RunRequest): Promise<ClaudeProcess> {
+    const { conversationId, chatId, gatewayKind } = request;
+    const existing = this._pool.get(conversationId);
+    if (existing?.isRunning) {
+      this._lastUsed.set(conversationId, Date.now());
+      return existing;
+    }
+
+    const resumeSessionId = this._sessionIds.get(conversationId);
+    const proc = new ClaudeProcess({
+      model: this.opts.model,
+      allowedTools: this.opts.allowedTools,
+      systemPrompt: this.opts.systemPrompt ?? null,
+      cwd: this._conversationCwd(conversationId),
+      resumeSessionId,
+      // Inject routing context so CLI tools (e.g. neoclaw-cron) know the current chat
+      extraEnv: { NEOCLAW_CHAT_ID: chatId, NEOCLAW_GATEWAY_KIND: gatewayKind },
+    });
+    await proc.start();
+    this._pool.set(conversationId, proc);
+    this._lastUsed.set(conversationId, Date.now());
+    this._scheduleCleanup();
+    log.info(
+      `Started process for conversation "${conversationId}" (pool size: ${this._pool.size})` +
+        (resumeSessionId ? ` [resuming session ${resumeSessionId.slice(0, 8)}…]` : '')
+    );
+    return proc;
+  }
+
+  private _scheduleCleanup(): void {
+    if (this._cleanupTimer) return;
+    this._cleanupTimer = setInterval(() => this._reapIdleProcesses(), CLEANUP_INTERVAL_MS);
+    if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref();
+  }
+
+  private async _reapIdleProcesses(): Promise<void> {
+    const cutoff = Date.now() - IDLE_TIMEOUT_MS;
+    const stale = [...this._lastUsed.entries()].filter(([, ts]) => ts < cutoff).map(([id]) => id);
+
+    for (const id of stale) {
+      log.info(`Reaping idle process for conversation "${id}"`);
+      await this._pool.get(id)?.terminate();
+      this._pool.delete(id);
+      this._lastUsed.delete(id);
+    }
+
+    if (this._pool.size === 0 && this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
+  }
+}

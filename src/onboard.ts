@@ -1,0 +1,147 @@
+/**
+ * Onboarding wizard — generates a config template at ~/.neoclaw/config.json.
+ *
+ * Run with: bun onboard
+ */
+
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { NEOCLAW_HOME, DEFAULTS } from './config.js';
+
+const CONFIG_PATH = join(NEOCLAW_HOME, 'config.json');
+
+// Build the template from DEFAULTS.
+// - systemPrompt is excluded: the built-in default is used when not configured.
+// - Credential fields use placeholder strings as a guide for the user.
+const TEMPLATE = {
+  ...DEFAULTS,
+  agent: {
+    ...DEFAULTS.agent,
+    systemPrompt: undefined,
+  },
+  feishu: {
+    ...DEFAULTS.feishu,
+    appId: 'YOUR_FEISHU_APP_ID',
+    appSecret: 'YOUR_FEISHU_APP_SECRET',
+  },
+};
+
+export async function runOnboard(): Promise<void> {
+  console.log('NeoClaw Onboarding Wizard');
+  console.log('='.repeat(50));
+  console.log();
+
+  // Ensure ~/.neoclaw exists
+  if (!existsSync(NEOCLAW_HOME)) {
+    mkdirSync(NEOCLAW_HOME, { recursive: true });
+    console.log(`Created ${NEOCLAW_HOME}`);
+  }
+
+  // ── Step 1: Config file ───────────────────────────────────────
+  initConfig();
+
+  // ── Step 2: CLI tools ─────────────────────────────────────────
+  console.log();
+  await installCronCli();
+
+  // ── Step 3: Memory directory ──────────────────────────────────
+  console.log();
+  initMemoryDir();
+
+  console.log();
+  console.log('Next steps:');
+  console.log('  1. Open the config file and fill in your Feishu credentials:');
+  console.log(`     ${CONFIG_PATH}`);
+  console.log();
+  console.log('  Required fields:');
+  console.log('     feishu.appId           — from Feishu Open Platform');
+  console.log('     feishu.appSecret        — from Feishu Open Platform');
+  console.log('     feishu.verificationToken — from Event Subscriptions');
+  console.log();
+  console.log('  2. Make sure Claude Code is installed:');
+  console.log('     npm install -g @anthropic-ai/claude-code');
+  console.log();
+  console.log('  3. Start the daemon:');
+  console.log('     bun start');
+  console.log();
+  console.log('  4. Add ~/.neoclaw/bin to your PATH (for neoclaw-cron and other CLI tools):');
+  console.log('     echo \'export PATH="$HOME/.neoclaw/bin:$PATH"\' >> ~/.zshrc  # or ~/.bashrc');
+  console.log();
+  console.log('  5. In Feishu, send a message to your bot to test it!');
+  console.log();
+}
+
+/** Write config template if not already configured; print current config otherwise. */
+function initConfig(): void {
+  if (existsSync(CONFIG_PATH)) {
+    const existing = readFileSync(CONFIG_PATH, 'utf-8');
+    let hasRealCredentials = false;
+    try {
+      const cfg = JSON.parse(existing);
+      hasRealCredentials =
+        typeof cfg?.feishu?.appId === 'string' &&
+        cfg.feishu.appId !== '' &&
+        !cfg.feishu.appId.startsWith('YOUR_');
+    } catch {
+      /* parse error — overwrite */
+    }
+
+    if (hasRealCredentials) {
+      console.log(`Config already exists at: ${CONFIG_PATH} (credentials configured, skipping)`);
+      return;
+    }
+
+    console.log(`Overwriting existing template at: ${CONFIG_PATH}`);
+  }
+
+  const content = JSON.stringify(TEMPLATE, null, 2);
+  writeFileSync(CONFIG_PATH, content);
+  console.log(`Config template written to: ${CONFIG_PATH}`);
+}
+
+// ── Memory directory ──────────────────────────────────────────
+
+/** Initialize ~/.neoclaw/memory/ with template files if they don't already exist. */
+function initMemoryDir(): void {
+  const memoryDir = join(NEOCLAW_HOME, 'memory');
+  if (!existsSync(memoryDir)) mkdirSync(memoryDir, { recursive: true });
+
+  const srcDir = fileURLToPath(new URL('.', import.meta.url));
+  const templatesDir = join(srcDir, 'templates');
+
+  for (const file of ['MEMORY.md', 'SOUL.md']) {
+    const dest = join(memoryDir, file);
+    if (!existsSync(dest)) {
+      copyFileSync(join(templatesDir, file), dest);
+      console.log(`Memory template written to: ${dest}`);
+    } else {
+      console.log(`Memory file already exists, skipping: ${dest}`);
+    }
+  }
+}
+
+// ── Install CLI tools ─────────────────────────────────────────
+
+/** Compile and install the neoclaw-cron CLI binary to ~/.neoclaw/bin/neoclaw-cron. */
+async function installCronCli(): Promise<void> {
+  const binDir = join(NEOCLAW_HOME, 'bin');
+  if (!existsSync(binDir)) mkdirSync(binDir, { recursive: true });
+
+  const outfile = join(binDir, 'neoclaw-cron');
+  // Derive project root from this file's location (src/onboard.ts → project root)
+  const srcDir = fileURLToPath(new URL('.', import.meta.url));
+  const cronCliSrc = join(srcDir, 'cli', 'cron.ts');
+
+  console.log('Building neoclaw-cron CLI...');
+  const result = Bun.spawnSync(['bun', 'build', '--compile', cronCliSrc, '--outfile', outfile], {
+    stdout: 'inherit',
+    stderr: 'inherit',
+  });
+
+  if (result.exitCode === 0) {
+    console.log(`neoclaw-cron installed to: ${outfile}`);
+  } else {
+    console.error(`Failed to build neoclaw-cron (exit code ${result.exitCode})`);
+  }
+}
