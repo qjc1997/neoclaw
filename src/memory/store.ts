@@ -74,6 +74,20 @@ export class MemoryStore {
     );
   }
 
+  get(id: string): MemoryEntry | null {
+    type Row = { id: string; category: string; title: string; content: string; tags: string; date: string };
+    const row = this.db.query('SELECT id, category, title, content, tags, date FROM memory WHERE id = ?').get(id) as Row | null;
+    if (!row) return null;
+    return {
+      id: row.id,
+      category: row.category as MemoryEntry['category'],
+      title: row.title,
+      content: row.content,
+      tags: row.tags ? row.tags.split(',') : [],
+      date: row.date,
+    };
+  }
+
   delete(id: string): void {
     this.db.run('DELETE FROM memory WHERE id = ?', [id]);
   }

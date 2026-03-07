@@ -29,6 +29,22 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
+      name: 'memory_read',
+      description:
+        'Read the full content of a specific memory entry by id. Use memory_list to discover available ids.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          id: {
+            type: 'string',
+            description:
+              'Memory entry id (file name without .md extension, e.g. "SOUL", "owner-profile", "preferences")',
+          },
+        },
+        required: ['id'],
+      },
+    },
+    {
       name: 'memory_search',
       description: 'Search through stored memories (identity, knowledge base, and episode history)',
       inputSchema: {
@@ -95,6 +111,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   let result: string;
   switch (name) {
+    case 'memory_read':
+      result = await manager.handleRead(args ?? {});
+      break;
     case 'memory_search':
       result = await manager.handleSearch(args ?? {});
       break;

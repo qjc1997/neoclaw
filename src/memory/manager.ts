@@ -37,6 +37,21 @@ export class MemoryManager {
 
   // ── Tool handlers (return stringified results for the agent) ──
 
+  async handleRead(input: unknown): Promise<string> {
+    const { id } = input as { id: string };
+    if (!id) return 'Error: "id" is required.';
+
+    try {
+      const entry = this.store.get(id);
+      if (!entry) return `No memory found with id "${id}".`;
+
+      const tagStr = entry.tags.length > 0 ? ` [${entry.tags.join(', ')}]` : '';
+      return `### ${entry.title}${tagStr}\n**Category**: ${entry.category} | **Date**: ${entry.date}\n\n${entry.content}`;
+    } catch (err) {
+      return `Read error: ${err}`;
+    }
+  }
+
   async handleSearch(input: unknown): Promise<string> {
     const { query, category } = input as { query: string; category?: string };
     if (!query) return 'Error: "query" is required.';
