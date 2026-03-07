@@ -265,77 +265,12 @@ export class NeoClawDaemon {
       skillsDir: this.config.skillsDir,
     });
 
-    // Initialize memory system
+    // Initialize memory system (used for session summarization and periodic reindex)
     const memoryDir = join(NEOCLAW_HOME, 'memory');
     const memoryStore = new MemoryStore(join(memoryDir, 'index.sqlite'));
     const memoryManager = new MemoryManager(memoryDir, memoryStore);
     memoryManager.reindex();
     this._memoryManager = memoryManager;
-
-    // Register memory tools on the agent
-    agent.registerTool({
-      name: 'memory_search',
-      description: 'Search through stored memories (identity, knowledge base, and episode history)',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Search query text' },
-          category: {
-            type: 'string',
-            enum: ['identity', 'episode', 'knowledge'],
-            description: 'Optional: filter by category',
-          },
-        },
-        required: ['query'],
-      },
-      handler: (input) => memoryManager.handleSearch(input),
-    });
-
-    agent.registerTool({
-      name: 'memory_save',
-      description:
-        'Save information to memory. Use category="identity" to update SOUL.md, or omit/use "knowledge" for the knowledge base.',
-      parameters: {
-        type: 'object',
-        properties: {
-          topic: {
-            type: 'string',
-            description:
-              'Topic/title for the memory entry (required for knowledge, ignored for identity)',
-          },
-          content: { type: 'string', description: 'Markdown content to save' },
-          tags: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'Optional tags for categorization',
-          },
-          category: {
-            type: 'string',
-            enum: ['identity', 'knowledge'],
-            description:
-              'Target category. "identity" writes SOUL.md, "knowledge" (default) writes to knowledge/',
-          },
-        },
-        required: ['content'],
-      },
-      handler: (input) => memoryManager.handleSave(input),
-    });
-
-    agent.registerTool({
-      name: 'memory_list',
-      description: 'List all stored memory entries',
-      parameters: {
-        type: 'object',
-        properties: {
-          category: {
-            type: 'string',
-            enum: ['identity', 'episode', 'knowledge'],
-            description: 'Optional: filter by category',
-          },
-        },
-      },
-      handler: (input) => memoryManager.handleList(input),
-    });
 
     dispatcher.addAgent(agent);
     dispatcher.setDefaultAgent('claude_code');

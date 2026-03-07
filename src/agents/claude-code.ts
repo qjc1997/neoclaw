@@ -33,7 +33,6 @@ import type {
   Attachment,
   RunRequest,
   RunResponse,
-  ToolDefinition,
 } from './types.js';
 
 const log = logger('claude-code');
@@ -375,8 +374,6 @@ export class ClaudeCodeAgent implements Agent {
   private _lastUsed = new Map<string, number>();
   /** Persists session IDs so processes can be resumed after idle reap or daemon restart. */
   private _sessionIds = new Map<string, string>();
-  /** Custom tools registered by external modules (e.g. MemoryManager). */
-  private _tools = new Map<string, ToolDefinition>();
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _flushSessions = createDebouncedFlush(() => {
     try {
@@ -400,12 +397,6 @@ export class ClaudeCodeAgent implements Agent {
     } = {}
   ) {
     this._loadSessions();
-  }
-
-  /** Register a custom tool. Its calls will be intercepted from permission_denials. */
-  registerTool(tool: ToolDefinition): void {
-    this._tools.set(tool.name, tool);
-    log.info(`Custom tool registered: "${tool.name}"`);
   }
 
   // ── Agent interface ───────────────────────────────────────
@@ -433,68 +424,22 @@ export class ClaudeCodeAgent implements Agent {
     const textParts: string[] = [];
     const thinkingParts: string[] = [];
     let resultEvt: ResultEvent | null = null;
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    let totalCostUsd = 0;
 
     const proc = await this._getOrCreate(request);
 
-    // Outer loop: handle custom tool call → re-send → continue
-    let currentText = request.text;
-    let currentAttachments = request.attachments;
-    let isFirstExchange = true;
-
-    while (true) {
-      const exchange = isFirstExchange
-        ? proc.exchange(currentText, currentAttachments)
-        : proc.exchange(currentText);
-      isFirstExchange = false;
-
-      for await (const evt of exchange) {
-        if (evt.type === 'content_block_delta') {
-          const delta = (evt as ContentBlockDeltaEvent).delta;
-          if (delta.type === 'text_delta') {
-            textParts.push(delta.text);
-            yield { type: 'text_delta', text: delta.text };
-          } else if (delta.type === 'thinking_delta') {
-            thinkingParts.push(delta.thinking);
-            yield { type: 'thinking_delta', text: delta.thinking };
-          }
-        } else if (evt.type === 'result') {
-          resultEvt = evt as ResultEvent;
+    for await (const evt of proc.exchange(request.text, request.attachments)) {
+      if (evt.type === 'content_block_delta') {
+        const delta = (evt as ContentBlockDeltaEvent).delta;
+        if (delta.type === 'text_delta') {
+          textParts.push(delta.text);
+          yield { type: 'text_delta', text: delta.text };
+        } else if (delta.type === 'thinking_delta') {
+          thinkingParts.push(delta.thinking);
+          yield { type: 'thinking_delta', text: delta.thinking };
         }
+      } else if (evt.type === 'result') {
+        resultEvt = evt as ResultEvent;
       }
-
-      if (!resultEvt) break;
-
-      // Accumulate token usage across tool-call rounds
-      totalInputTokens += resultEvt.usage?.input_tokens ?? 0;
-      totalOutputTokens += resultEvt.usage?.output_tokens ?? 0;
-      totalCostUsd += resultEvt.cost_usd ?? 0;
-
-      // Check for custom tool calls in permission_denials
-      const customToolCalls = this._extractCustomToolCalls(resultEvt);
-      if (customToolCalls.length === 0) break;
-
-      // Execute custom tool handlers and send results back
-      const results: string[] = [];
-      for (const call of customToolCalls) {
-        const tool = this._tools.get(call.tool_name)!;
-        try {
-          log.info(
-            `Executing custom tool "${call.tool_name}" with input: ${JSON.stringify(call.tool_input)}`
-          );
-          const result = await tool.handler(call.tool_input);
-          results.push(`[Tool result for ${call.tool_name}]: ${result}`);
-        } catch (err) {
-          results.push(`[Tool result for ${call.tool_name}]: Error: ${err}`);
-        }
-      }
-
-      // Send tool results back as a user message to continue the conversation
-      currentText = results.join('\n\n');
-      currentAttachments = undefined;
-      resultEvt = null;
     }
 
     if (resultEvt?.session_id) {
@@ -523,19 +468,13 @@ export class ClaudeCodeAgent implements Agent {
         text,
         thinking,
         sessionId: resultEvt?.session_id ?? null,
-        costUsd: totalCostUsd || (resultEvt?.cost_usd ?? null),
-        inputTokens: totalInputTokens || (resultEvt?.usage?.input_tokens ?? null),
-        outputTokens: totalOutputTokens || (resultEvt?.usage?.output_tokens ?? null),
+        costUsd: resultEvt?.cost_usd ?? null,
+        inputTokens: resultEvt?.usage?.input_tokens ?? null,
+        outputTokens: resultEvt?.usage?.output_tokens ?? null,
         elapsedMs: Date.now() - t0,
         model: resultEvt?.model ?? null,
       },
     };
-  }
-
-  /** Extract custom tool calls (registered via registerTool) from permission_denials. */
-  private _extractCustomToolCalls(resultEvt: ResultEvent): PermissionDenial[] {
-    if (!resultEvt.permission_denials) return [];
-    return resultEvt.permission_denials.filter((d) => this._tools.has(d.tool_name));
   }
 
   async healthCheck(): Promise<boolean> {
@@ -620,15 +559,23 @@ export class ClaudeCodeAgent implements Agent {
       mcpServers = this.opts.mcpServers;
     }
 
+    // Inject built-in memory MCP server
+    const memoryDir = join(homedir(), '.neoclaw', 'memory');
+    const mcpServerScript = join(import.meta.dir, '..', 'memory', 'mcp-server.ts');
+    const allServers: Record<string, McpServerConfig> = {
+      ...mcpServers,
+      'neoclaw-memory': {
+        type: 'stdio',
+        command: 'bun',
+        args: ['run', mcpServerScript],
+        env: { NEOCLAW_MEMORY_DIR: memoryDir },
+      },
+    };
+
     const mcpPath = join(cwd, '.mcp.json');
-    if (mcpServers && Object.keys(mcpServers).length > 0) {
-      const mcpConfig = { mcpServers };
-      writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2));
-      log.info(`Wrote .mcp.json to ${cwd}`);
-    } else if (existsSync(mcpPath)) {
-      unlinkSync(mcpPath);
-      log.info(`Removed stale .mcp.json from ${cwd}`);
-    }
+    const mcpConfig = { mcpServers: allServers };
+    writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2));
+    log.info(`Wrote .mcp.json to ${cwd}`);
   }
 
   /** Sync skill symlinks: create new, update changed, remove stale. */

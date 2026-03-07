@@ -1,21 +1,17 @@
 ---
-title: "Owner Profile"
+title: "Owner personal info, background, career"
 date: 2026-03-07
-tags: [owner, profile]
+tags: []
 ---
 
-## Personal context
+## Personal
 
-(Important facts about your Master)
+(Name, background, location, languages, etc.)
 
-## Work context
+## Career
 
-(Important facts about your Master's work)
+(Current role, company, industry, expertise)
 
-## Top of minds
+## Top of mind
 
-(Top of your Master's minds)
-
-## Preferences
-
-(Your Master's preferences and habits)
+(What the owner is currently focused on or thinking about)

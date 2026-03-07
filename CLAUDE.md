@@ -40,9 +40,8 @@ Gateway.start(dispatcher.handle)
 - `AgentStreamEvent`: `{ type: 'thinking_delta', text }` | `{ type: 'text_delta', text }` | `{ type: 'done', response: RunResponse }`
 - `InboundMessage`: `id`, `text`, `chatId`, `threadRootId?`, `authorId`, `authorName?`, `gatewayKind`, `attachments?: Attachment[]`, `meta?`
 - `RunResponse`: `text`, `thinking?`, `sessionId?`, `costUsd?`, `inputTokens?`, `outputTokens?`, `elapsedMs?`, `model?`
-- `ToolDefinition`: `name`, `description`, `parameters` (JSON Schema), `handler` — for custom tool registration
 
-**Agents**: `ClaudeCodeAgent` uses Claude Code CLI via long-running subprocess with bidirectional JSONL streaming. Maintains one subprocess per `conversationId` (pooled, reaped after 10 min idle). After idle reap, session IDs are persisted in memory so the next request **resumes** the same Claude session (`--resume <sessionId>`). Each conversation runs in its own workspace directory `~/.neoclaw/workspaces/<conversationId>` (`:` replaced with `_`); the directory is created on first use. Supports custom tool registration via `registerTool(ToolDefinition)` — tool calls are intercepted from the JSONL stream and dispatched to registered handlers. Default model: `claude-sonnet-4-6`.
+**Agents**: `ClaudeCodeAgent` uses Claude Code CLI via long-running subprocess with bidirectional JSONL streaming. Maintains one subprocess per `conversationId` (pooled, reaped after 10 min idle). After idle reap, session IDs are persisted in memory so the next request **resumes** the same Claude session (`--resume <sessionId>`). Each conversation runs in its own workspace directory `~/.neoclaw/workspaces/<conversationId>` (`:` replaced with `_`); the directory is created on first use. Default model: `claude-sonnet-4-6`.
 
 The `stream()` method on `ClaudeCodeAgent` yields `AgentStreamEvent`s: `thinking_delta` and `text_delta` are emitted for each JSONL `content_block_delta`; a final `done` event carries the full `RunResponse` (including stats).
 
@@ -104,13 +103,13 @@ Key config fields (`~/.neoclaw/config.json`):
 
 Env var overrides: `NEOCLAW_AGENT_TYPE`, `NEOCLAW_MODEL`, `NEOCLAW_SYSTEM_PROMPT`, `NEOCLAW_ALLOWED_TOOLS`, `NEOCLAW_TIMEOUT_SECS`, `NEOCLAW_LOG_LEVEL`, `NEOCLAW_WORKSPACES_DIR`, `NEOCLAW_SKILLS_DIR`, `NEOCLAW_CONFIG` (config file path), `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_VERIFICATION_TOKEN`, `FEISHU_ENCRYPT_KEY`, `FEISHU_DOMAIN`, `FEISHU_GROUP_AUTO_REPLY`.
 
-**MCP & Skills workspace sync** (`ClaudeCodeAgent._prepareWorkspace()`): Runs each time a new Claude Code subprocess starts. `_syncMcpServers()` hot-reloads `mcpServers` from the config file (not cached opts) and writes `<workspace>/.mcp.json`. `_syncSkills()` reads `skillsDir`, symlinks valid skill directories (containing `SKILL.md`) into `<workspace>/.claude/skills/`, and removes stale symlinks for deleted skills.
+**MCP & Skills workspace sync** (`ClaudeCodeAgent._prepareWorkspace()`): Runs each time a new Claude Code subprocess starts. `_syncMcpServers()` hot-reloads `mcpServers` from the config file (not cached opts) and writes `<workspace>/.mcp.json`; the built-in `neoclaw-memory` MCP server is always injected alongside user-configured servers. `_syncSkills()` reads `skillsDir`, symlinks valid skill directories (containing `SKILL.md`) into `<workspace>/.claude/skills/`, and removes stale symlinks for deleted skills.
 
-**Memory system** (`src/memory/`): Three-layer architecture managed through custom tools:
+**Memory system** (`src/memory/`): Three-layer architecture exposed via a built-in stdio MCP server (`mcp-server.ts`):
 - `MemoryStore` (`store.ts`): SQLite FTS5 index over markdown files. Content table + FTS5 virtual table with triggers for sync. Categories: `identity`, `knowledge`, `episode`. `reindex(memoryDir)` rebuilds from disk.
 - `MemoryManager` (`manager.ts`): Tool handlers (`handleSearch`, `handleSave`, `handleList`), session summarization (`summarizeSession`), periodic reindex (every 5 min via `startPeriodicReindex()`).
 - `summarizer.ts`: Calls `claude --print` (haiku model, configurable via `agent.summaryModel`) to generate structured session summaries.
-- **Tool interception**: Tools are registered on `ClaudeCodeAgent` via `registerTool()`. When agent calls them, Claude Code denies (not in `--allowedTools`), NeoClaw intercepts from `permission_denials` in `stream()`, executes handler, sends result back as user message, and continues streaming (while loop supports multi-round tool calls).
+- **MCP Server** (`mcp-server.ts`): Standalone stdio MCP server that instantiates its own `MemoryStore` + `MemoryManager`. Automatically injected into each workspace's `.mcp.json` so Claude Code can directly call `memory_search`, `memory_save`, `memory_list`. Receives `NEOCLAW_MEMORY_DIR` via environment variable.
 - **Session summarization**: On `/clear` or `/new`, Dispatcher calls `summarizeSession()` which reads only new content from `.history/` (tracked via `.last-summarized-offset` marker), generates summary, saves to `episodes/`, updates index.
 - **Storage layout**: `~/.neoclaw/memory/` — `SOUL.md` (identity), `knowledge/*.md` (semantic), `episodes/*.md` (episodic), `index.sqlite` (FTS5 index).
 - Three tools: `memory_search` (query + optional category filter), `memory_save` (content + topic for knowledge, or category="identity" for SOUL.md), `memory_list` (optional category filter).

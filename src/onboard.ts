@@ -137,13 +137,15 @@ function initMemoryDir(): void {
     console.log(`Memory file already exists, skipping: ${soulDest}`);
   }
 
-  // Copy owner-profile.md template to knowledge/
-  const ownerProfileDest = join(memoryDir, 'knowledge', 'owner-profile.md');
-  if (!existsSync(ownerProfileDest)) {
-    copyFileSync(join(templatesDir, 'owner-profile.md'), ownerProfileDest);
-    console.log(`Memory template written to: ${ownerProfileDest}`);
-  } else {
-    console.log(`Memory file already exists, skipping: ${ownerProfileDest}`);
+  // Copy knowledge topic templates
+  for (const topic of ['owner-profile', 'preferences', 'people', 'projects', 'notes']) {
+    const dest = join(memoryDir, 'knowledge', `${topic}.md`);
+    if (!existsSync(dest)) {
+      copyFileSync(join(templatesDir, `${topic}.md`), dest);
+      console.log(`Memory template written to: ${dest}`);
+    } else {
+      console.log(`Memory file already exists, skipping: ${dest}`);
+    }
   }
 }
 

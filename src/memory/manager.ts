@@ -17,6 +17,16 @@ const log = logger('memory');
 
 const REINDEX_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+export const KNOWLEDGE_TOPICS = {
+  'owner-profile': 'Owner personal info, background, career',
+  'preferences': 'Preferences, habits, tools, workflow',
+  'people': 'People and contacts',
+  'projects': 'Project notes, technical decisions',
+  'notes': 'General knowledge and miscellaneous',
+} as const;
+
+export type KnowledgeTopic = keyof typeof KNOWLEDGE_TOPICS;
+
 export class MemoryManager {
   private _reindexTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -80,16 +90,14 @@ export class MemoryManager {
 
       // Knowledge memory: write to knowledge/<topic>.md
       if (!topic) return 'Error: "topic" is required for knowledge memory.';
+      if (!(topic in KNOWLEDGE_TOPICS))
+        return `Error: invalid topic "${topic}". Must be one of: ${Object.keys(KNOWLEDGE_TOPICS).join(', ')}`;
 
-      const id = topic
-        .toLowerCase()
-        .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
-        .replace(/^-|-$/g, '');
       const tagList = tags ?? [];
 
       const frontmatter = [
         '---',
-        `title: "${topic}"`,
+        `title: "${KNOWLEDGE_TOPICS[topic as KnowledgeTopic]}"`,
         `date: ${date}`,
         `tags: [${tagList.join(', ')}]`,
         '---',
@@ -98,19 +106,19 @@ export class MemoryManager {
 
       const knowledgeDir = join(this.memoryDir, 'knowledge');
       if (!existsSync(knowledgeDir)) mkdirSync(knowledgeDir, { recursive: true });
-      writeFileSync(join(knowledgeDir, `${id}.md`), markdown, 'utf-8');
+      writeFileSync(join(knowledgeDir, `${topic}.md`), markdown, 'utf-8');
 
       this.store.upsert({
-        id,
+        id: topic,
         category: 'knowledge',
-        title: topic,
+        title: KNOWLEDGE_TOPICS[topic as KnowledgeTopic],
         content,
         tags: tagList,
         date,
       });
 
-      log.info(`Saved knowledge: "${topic}" (${id}.md)`);
-      return `Memory saved: "${topic}" (knowledge/${id}.md)`;
+      log.info(`Saved knowledge: "${topic}" (${topic}.md)`);
+      return `Memory saved: "${topic}" (knowledge/${topic}.md)`;
     } catch (err) {
       return `Save error: ${err}`;
     }
