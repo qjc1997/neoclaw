@@ -4,10 +4,10 @@
  * Run with: bun onboard
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NEOCLAW_HOME, DEFAULTS } from './config.js';
+import { DEFAULTS, NEOCLAW_HOME } from './config.js';
 
 const CONFIG_PATH = join(NEOCLAW_HOME, 'config.json');
 
@@ -25,14 +25,6 @@ const TEMPLATE = {
     appId: 'YOUR_FEISHU_APP_ID',
     appSecret: 'YOUR_FEISHU_APP_SECRET',
   },
-  mcpServers: {
-    'example-server': {
-      type: 'stdio',
-      command: 'npx',
-      args: ['-y', '@example/mcp-server'],
-    },
-  },
-  skillsDir: DEFAULTS.skillsDir,
 };
 
 export async function runOnboard(): Promise<void> {
@@ -119,22 +111,39 @@ function initConfig(): void {
 
 // ── Memory directory ──────────────────────────────────────────
 
-/** Initialize ~/.neoclaw/memory/ with template files if they don't already exist. */
+/** Initialize ~/.neoclaw/memory/ with template files and subdirectories. */
 function initMemoryDir(): void {
   const memoryDir = join(NEOCLAW_HOME, 'memory');
   if (!existsSync(memoryDir)) mkdirSync(memoryDir, { recursive: true });
 
+  // Create knowledge/ and episodes/ subdirectories
+  for (const sub of ['knowledge', 'episodes']) {
+    const dir = join(memoryDir, sub);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+      console.log(`Created memory subdirectory: ${dir}`);
+    }
+  }
+
   const srcDir = fileURLToPath(new URL('.', import.meta.url));
   const templatesDir = join(srcDir, 'templates');
 
-  for (const file of ['MEMORY.md', 'SOUL.md']) {
-    const dest = join(memoryDir, file);
-    if (!existsSync(dest)) {
-      copyFileSync(join(templatesDir, file), dest);
-      console.log(`Memory template written to: ${dest}`);
-    } else {
-      console.log(`Memory file already exists, skipping: ${dest}`);
-    }
+  // Copy SOUL.md template
+  const soulDest = join(memoryDir, 'SOUL.md');
+  if (!existsSync(soulDest)) {
+    copyFileSync(join(templatesDir, 'SOUL.md'), soulDest);
+    console.log(`Memory template written to: ${soulDest}`);
+  } else {
+    console.log(`Memory file already exists, skipping: ${soulDest}`);
+  }
+
+  // Copy owner-profile.md template to knowledge/
+  const ownerProfileDest = join(memoryDir, 'knowledge', 'owner-profile.md');
+  if (!existsSync(ownerProfileDest)) {
+    copyFileSync(join(templatesDir, 'owner-profile.md'), ownerProfileDest);
+    console.log(`Memory template written to: ${ownerProfileDest}`);
+  } else {
+    console.log(`Memory file already exists, skipping: ${ownerProfileDest}`);
   }
 }
 

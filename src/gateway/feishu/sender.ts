@@ -20,9 +20,9 @@
 
 import type * as Lark from '@larksuiteoapi/node-sdk';
 import type { AskQuestion } from '../../agents/types.js';
+import { logger } from '../../utils/logger.js';
 import type { SendResult } from './client.js';
 import { idType } from './client.js';
-import { logger } from '../../utils/logger.js';
 
 const log = logger('sender');
 

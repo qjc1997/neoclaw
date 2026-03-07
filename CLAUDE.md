@@ -106,10 +106,19 @@ Env var overrides: `NEOCLAW_AGENT_TYPE`, `NEOCLAW_MODEL`, `NEOCLAW_SYSTEM_PROMPT
 
 **MCP & Skills workspace sync** (`ClaudeCodeAgent._prepareWorkspace()`): Runs each time a new Claude Code subprocess starts. `_syncMcpServers()` hot-reloads `mcpServers` from the config file (not cached opts) and writes `<workspace>/.mcp.json`. `_syncSkills()` reads `skillsDir`, symlinks valid skill directories (containing `SKILL.md`) into `<workspace>/.claude/skills/`, and removes stale symlinks for deleted skills.
 
+**Memory system** (`src/memory/`): Three-layer architecture managed through custom tools:
+- `MemoryStore` (`store.ts`): SQLite FTS5 index over markdown files. Content table + FTS5 virtual table with triggers for sync. Categories: `identity`, `knowledge`, `episode`. `reindex(memoryDir)` rebuilds from disk.
+- `MemoryManager` (`manager.ts`): Tool handlers (`handleSearch`, `handleSave`, `handleList`), session summarization (`summarizeSession`), periodic reindex (every 5 min via `startPeriodicReindex()`).
+- `summarizer.ts`: Calls `claude --print` (haiku model, configurable via `agent.summaryModel`) to generate structured session summaries.
+- **Tool interception**: Tools are registered on `ClaudeCodeAgent` via `registerTool()`. When agent calls them, Claude Code denies (not in `--allowedTools`), NeoClaw intercepts from `permission_denials` in `stream()`, executes handler, sends result back as user message, and continues streaming (while loop supports multi-round tool calls).
+- **Session summarization**: On `/clear` or `/new`, Dispatcher calls `summarizeSession()` which reads only new content from `.history/` (tracked via `.last-summarized-offset` marker), generates summary, saves to `episodes/`, updates index.
+- **Storage layout**: `~/.neoclaw/memory/` — `SOUL.md` (identity), `knowledge/*.md` (semantic), `episodes/*.md` (episodic), `index.sqlite` (FTS5 index).
+- Three tools: `memory_search` (query + optional category filter), `memory_save` (content + topic for knowledge, or category="identity" for SOUL.md), `memory_list` (optional category filter).
+
 ## Conventions
 
 - Full async/await — no sync blocking in async paths
 - TypeScript strict mode with `noUncheckedIndexedAccess`
 - Interfaces over class inheritance for loose coupling
-- All runtime files (`logs/`, `cache/`, `workspaces/`, `skills/`) live under `~/.neoclaw/`; PID file at `~/.neoclaw/cache/neoclaw.pid`
+- All runtime files (`logs/`, `cache/`, `workspaces/`, `skills/`, `memory/`) live under `~/.neoclaw/`; PID file at `~/.neoclaw/cache/neoclaw.pid`
 - `Bun.spawn()` for subprocesses; `Bun.sleepSync()` only in daemon takeover loop

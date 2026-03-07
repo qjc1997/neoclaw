@@ -14,30 +14,30 @@
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
-import type { FeishuConfig } from '../../config.js';
-import type { Gateway, InboundMessage, MessageHandler, ReplyFn, StreamHandler } from '../types.js';
 import type { AgentStreamEvent, RunResponse } from '../../agents/types.js';
-import type { RawMessageEvent, BotCredentials } from './client.js';
-import { getHttpClient, getWsClient, getEventDispatcher, fetchBotInfo } from './client.js';
+import type { FeishuConfig } from '../../config.js';
+import { logger } from '../../utils/logger.js';
+import type { Gateway, InboundMessage, MessageHandler, ReplyFn, StreamHandler } from '../types.js';
+import type { BotCredentials, RawMessageEvent } from './client.js';
+import { fetchBotInfo, getEventDispatcher, getHttpClient, getWsClient } from './client.js';
 import { parseMessage } from './receiver.js';
 import {
-  sendCard,
-  sendMarkdown,
-  buildCard,
   addReaction,
-  removeReaction,
-  buildStreamingCard,
-  buildQuestionFormElements,
-  createCardEntity,
-  sendCardByRef,
-  updateCardText,
-  patchCardElement,
-  insertThinkingPanel,
   appendCardElements,
+  buildCard,
+  buildQuestionFormElements,
+  buildStreamingCard,
   closeCardStreaming,
+  createCardEntity,
+  insertThinkingPanel,
+  patchCardElement,
+  removeReaction,
+  sendCard,
+  sendCardByRef,
+  sendMarkdown,
   STREAM_EL,
+  updateCardText,
 } from './sender.js';
-import { logger } from '../../utils/logger.js';
 
 const log = logger('feishu');
 
@@ -161,9 +161,7 @@ export class FeishuGateway implements Gateway {
         if (value?.['_neoclaw_action'] !== 'questions_submit') return;
 
         // Fire-and-forget: handler sends the agent message asynchronously
-        this._handleCardAction(evt, client).catch((err) =>
-          log.error(`Card action handler error: ${err}`)
-        );
+        this._handleCardAction(evt).catch((err) => log.error(`Card action handler error: ${err}`));
 
         // Return a toast immediately so the Feishu client doesn't show an error
         return { toast: { type: 'success', content: 'Submitted, in progress...' } };
@@ -257,7 +255,7 @@ export class FeishuGateway implements Gateway {
    * Formats selected answers as a numbered list and dispatches it as a synthetic
    * InboundMessage so the agent can continue the conversation.
    */
-  private async _handleCardAction(event: CardActionEvent, client: Lark.Client): Promise<void> {
+  private async _handleCardAction(event: CardActionEvent): Promise<void> {
     if (!this._handler) return;
 
     const value = event.action?.value;

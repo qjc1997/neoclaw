@@ -12,51 +12,44 @@
  * Self-daemonizes on first launch (forks to background, redirects I/O to log file).
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { ClaudeCodeAgent } from './agents/claude-code.js';
 import type { NeoClawConfig } from './config.js';
 import { NEOCLAW_HOME } from './config.js';
-import { Dispatcher } from './dispatcher.js';
-import { ClaudeCodeAgent } from './agents/claude-code.js';
-import { FeishuGateway } from './gateway/feishu/gateway.js';
 import { CronScheduler } from './cron/scheduler.js';
-import { setLogLevel, initFileLogs, logger } from './utils/logger.js';
+import { Dispatcher } from './dispatcher.js';
+import { FeishuGateway } from './gateway/feishu/gateway.js';
+import { MemoryManager } from './memory/manager.js';
+import { MemoryStore } from './memory/store.js';
+import { initFileLogs, logger, setLogLevel } from './utils/logger.js';
 
 const log = logger('daemon');
 
 /** Build the system prompt section that describes the neoclaw-cron CLI to Claude. */
 function buildCronCliSystemPrompt(): string {
-  const binPath = join(NEOCLAW_HOME, 'bin', 'neoclaw-cron');
+  const bin = join(NEOCLAW_HOME, 'bin', 'neoclaw-cron');
   return `\
 ## Cron Job Management
 
-You can use \`${binPath}\` CLI tool to create and manage scheduled tasks.
-When a cron job triggers, it will automatically send a message to you in the current session for you to execute.
+Use \`${bin}\` to manage scheduled tasks. When a job triggers, its --message is sent to you in the current session.
 
-### Create One-time Task:
-${binPath} create --message "task description" --run-at "2024-03-01T09:00:00+08:00" [--label "task name"]
+### Commands
+\`\`\`bash
+# One-time task
+${bin} create --message "prompt" --run-at "2024-03-01T09:00:00+08:00" [--label "name"]
 
-### Create Recurring Task:
-${binPath} create --message "task description" --cron-expr "0 9 * * 1-5" [--label "task name"]
-Cron expression format: minute hour day month weekday
-Common examples:
-  "0 9 * * 1-5"   — 09:00 on weekdays
-  "0 */4 * * *"   — every 4 hours
-  "30 8 * * *"    — 08:30 daily
+# Recurring task (cron format: min hour day month weekday)
+${bin} create --message "prompt" --cron-expr "0 9 * * 1-5" [--label "name"]
 
-### List Tasks:
-${binPath} list                    # show only enabled tasks
-${binPath} list --include-disabled # show all tasks (including disabled)
+# List / delete / update
+${bin} list [--include-disabled]
+${bin} delete --job-id <id>
+${bin} update --job-id <id> [--label ".."] [--message ".."] [--enabled true|false] [--run-at ".."] [--cron-expr ".."]
+\`\`\`
 
-### Delete Task:
-${binPath} delete --job-id <jobId>
-
-### Update Task:
-${binPath} update --job-id <jobId> [--label "new name"] [--message "new prompt"] [--enabled true|false]
-${' '.repeat(binPath.length + 8)}[--run-at "new time"] [--cron-expr "new expression"]
-
-All commands output JSON. The value of --message is the prompt that will be sent to you when the task triggers.`;
+All commands output JSON.`;
 }
 
 // Path where the restart notification is persisted between process generations
@@ -64,6 +57,7 @@ const RESTART_NOTIFY_PATH = join(NEOCLAW_HOME, 'cache', 'restart-notify.json');
 
 export class NeoClawDaemon {
   private _abort = new AbortController();
+  private _memoryManager: MemoryManager | null = null;
 
   constructor(private readonly config: NeoClawConfig) {}
 
@@ -104,6 +98,7 @@ export class NeoClawDaemon {
 
     try {
       scheduler.start();
+      this._memoryManager?.startPeriodicReindex();
       await Promise.race([
         dispatcher.start(),
         // Resolve when abort is signaled
@@ -116,6 +111,7 @@ export class NeoClawDaemon {
     } catch (err) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) throw err;
     } finally {
+      this._memoryManager?.stopPeriodicReindex();
       scheduler.stop();
       await dispatcher.stop();
       log.info('NeoClaw daemon stopped.');
@@ -226,11 +222,15 @@ export class NeoClawDaemon {
   private _ensureDirs(): void {
     const dirs = [
       NEOCLAW_HOME,
-      join(NEOCLAW_HOME, 'logs'),
+      join(NEOCLAW_HOME, 'bin'),
       join(NEOCLAW_HOME, 'cache'),
       join(NEOCLAW_HOME, 'cron'),
-      this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
+      join(NEOCLAW_HOME, 'logs'),
+      join(NEOCLAW_HOME, 'memory'),
+      join(NEOCLAW_HOME, 'memory', 'episodes'),
+      join(NEOCLAW_HOME, 'memory', 'knowledge'),
       this.config.skillsDir ?? join(NEOCLAW_HOME, 'skills'),
+      this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
     ];
     for (const dir of dirs) {
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -264,9 +264,83 @@ export class NeoClawDaemon {
       mcpServers: this.config.mcpServers,
       skillsDir: this.config.skillsDir,
     });
+
+    // Initialize memory system
+    const memoryDir = join(NEOCLAW_HOME, 'memory');
+    const memoryStore = new MemoryStore(join(memoryDir, 'index.sqlite'));
+    const memoryManager = new MemoryManager(memoryDir, memoryStore);
+    memoryManager.reindex();
+    this._memoryManager = memoryManager;
+
+    // Register memory tools on the agent
+    agent.registerTool({
+      name: 'memory_search',
+      description: 'Search through stored memories (identity, knowledge base, and episode history)',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query text' },
+          category: {
+            type: 'string',
+            enum: ['identity', 'episode', 'knowledge'],
+            description: 'Optional: filter by category',
+          },
+        },
+        required: ['query'],
+      },
+      handler: (input) => memoryManager.handleSearch(input),
+    });
+
+    agent.registerTool({
+      name: 'memory_save',
+      description:
+        'Save information to memory. Use category="identity" to update SOUL.md, or omit/use "knowledge" for the knowledge base.',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: {
+            type: 'string',
+            description:
+              'Topic/title for the memory entry (required for knowledge, ignored for identity)',
+          },
+          content: { type: 'string', description: 'Markdown content to save' },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional tags for categorization',
+          },
+          category: {
+            type: 'string',
+            enum: ['identity', 'knowledge'],
+            description:
+              'Target category. "identity" writes SOUL.md, "knowledge" (default) writes to knowledge/',
+          },
+        },
+        required: ['content'],
+      },
+      handler: (input) => memoryManager.handleSave(input),
+    });
+
+    agent.registerTool({
+      name: 'memory_list',
+      description: 'List all stored memory entries',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: {
+            type: 'string',
+            enum: ['identity', 'episode', 'knowledge'],
+            description: 'Optional: filter by category',
+          },
+        },
+      },
+      handler: (input) => memoryManager.handleList(input),
+    });
+
     dispatcher.addAgent(agent);
     dispatcher.setDefaultAgent('claude_code');
     dispatcher.setWorkspacesDir(this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'));
+    dispatcher.setMemoryManager(memoryManager);
 
     // Register Feishu gateway if credentials are present
     if (this.config.feishu.appId && this.config.feishu.appSecret) {

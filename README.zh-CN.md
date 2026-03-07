@@ -59,9 +59,10 @@
 - **定时任务**: 支持 Cron 表达式创建和管理定时任务。
   <br/><img src="imgs/demo/cron.png" width="300" alt="Cron Jobs" />
 
-- **多层记忆系统**:
-  - **全局记忆** (`MEMORY.md` / `SOUL.md`): 存储个人上下文、性格设定
-  - **项目记忆** (`CLAUDE.md`): 每个工作区独立的上下文
+- **三层记忆系统**:
+  - **身份记忆** (`SOUL.md`): 性格、价值观、沟通风格
+  - **语义记忆** (`knowledge/`): 按主题组织的持久化知识，支持 FTS5 全文搜索
+  - **情景记忆** (`episodes/`): `/clear` 或 `/new` 时自动生成的会话摘要
 
 - **自进化能力**: 支持通过对话让 NeoClaw 修改自身代码，并通过 `/restart` 命令重启生效，实现持续进化。
 
@@ -248,29 +249,46 @@ Skills 在新进程启动时自动同步到各工作区：新增的 Skill 会被
 
 ## 🧠 记忆系统
 
-NeoClaw 拥有两层记忆系统，模拟人类的长期记忆与短期工作记忆：
+NeoClaw 拥有三层记忆系统，使用 SQLite FTS5 全文索引，完全通过自定义工具（`memory_search`、`memory_save`、`memory_list`）管理：
 
-### 全局记忆 (Long-term Memory)
+```
+~/.neoclaw/memory/
+├── SOUL.md              # 身份记忆：性格、价值观、沟通风格
+├── knowledge/           # 语义记忆：按主题组织的持久化知识（带 frontmatter）
+├── episodes/            # 情景记忆：自动生成的会话摘要
+└── index.sqlite         # FTS5 全文搜索索引
+```
 
-位于 `~/.neoclaw/memory/`：
-- `MEMORY.md`: 记录主人的个人上下文、工作背景、首要事项等。
-- `SOUL.md`: 定义 NeoClaw 的性格、价值观、沟通风格。
+| 类别 | 说明 | 读取 | 写入 |
+|------|------|------|------|
+| **identity** | 性格、价值观、沟通风格 | `memory_search` / `memory_list` | `memory_save` + `category="identity"` |
+| **knowledge** | 按主题组织的持久化知识 | `memory_search` / `memory_list` | `memory_save` + `topic` + `content` |
+| **episode** | 自动生成的会话摘要 | `memory_search` / `memory_list` | `/clear` 或 `/new` 时自动生成 |
 
-### 项目记忆 (Contextual Memory)
+### 工具拦截机制
 
-位于每个工作区目录下的 `CLAUDE.md` 或 `AGENTS.md`，用于存储特定项目或会话的上下文信息。
+记忆工具通过 `ClaudeCodeAgent` 的自定义工具注册。Agent 调用时，Claude Code 拒绝该调用（不在 `--allowedTools` 中），NeoClaw 从 `permission_denials` 中拦截，执行 handler，并将结果作为 user message 发回。
 
-### 记忆读取规则
+### 索引更新时机
 
-- **新会话**: 自动读取当前工作区的项目记忆。
-- **主人 (zuidas)**: 若发起者为主人，同时读取全局记忆。
-- **其他用户**: 仅访问项目记忆，保护全局隐私。
+- **启动时**：从磁盘全量重建索引
+- **每 5 分钟**：定期重建，捕获外部文件变更
+- **`memory_save` 调用时**：即时更新
+- **`/clear` 或 `/new` 时**：生成会话摘要并索引
 
-### 记忆更新规则
+### 会话摘要
 
-- **通用**: 所有聊天都会更新项目记忆。
-- **主人**: 主人的聊天内容会同时更新项目记忆和全局记忆。
-- **自动维护**: 支持通过定时任务每天凌晨 4 点自动整理和更新全局记忆。
+当使用 `/clear` 或 `/new` 时，Dispatcher 自动生成情景记忆：
+1. 读取 `.history/` 下的对话日志（仅读取上次摘要之后的新增内容，通过 `.last-summarized-offset` 追踪）
+2. 调用 Claude（haiku 模型）生成结构化摘要
+3. 保存到 `episodes/` 并更新 FTS5 索引
+
+### 记忆规则
+
+- 新会话开始时，Agent 自动搜索记忆获取相关上下文
+- 主人的重要信息保存到 knowledge 记忆
+- 其他用户可以搜索但不能写入
+- 记忆内容不会泄露给非主人用户
 
 ## 📚 技术栈
 

@@ -12,13 +12,12 @@
     "@larksuiteoapi/node-sdk": "^1.59.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/bun": "latest",
-    "@typescript-eslint/eslint-plugin": "^8.0.0",
-    "@typescript-eslint/parser": "^8.0.0",
     "eslint": "^9.0.0",
     "eslint-config-prettier": "^10.0.0",
-    "eslint-plugin-import-x": "^4.16.1",
     "eslint-plugin-prettier": "^5.0.0",
-    "prettier": "^3.0.0"
+    "prettier": "^3.0.0",
+    "typescript-eslint": "^8.0.0"
   }
 }

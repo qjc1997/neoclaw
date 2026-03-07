@@ -7,22 +7,25 @@
  * Supports custom tool registration.
  */
 
+import type { FileSink, Subprocess } from 'bun';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
-  symlinkSync,
-  lstatSync,
   readlinkSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { McpServerConfig } from '../config.js';
 import { loadConfig } from '../config.js';
-import type { FileSink, Subprocess } from 'bun';
+import { createDebouncedFlush } from '../utils/debounced-flush.js';
+import { logger } from '../utils/logger.js';
+import { Mutex } from '../utils/mutex.js';
 import type {
   Agent,
   AgentStreamEvent,
@@ -30,12 +33,20 @@ import type {
   Attachment,
   RunRequest,
   RunResponse,
+  ToolDefinition,
 } from './types.js';
-import { Mutex } from '../utils/mutex.js';
-import { createDebouncedFlush } from '../utils/debounced-flush.js';
-import { logger } from '../utils/logger.js';
 
 const log = logger('claude-code');
+
+/**
+ * System prompt hint appended to every Claude Code session.
+ * Explains that AskUserQuestion denials are transparently handled by the gateway.
+ */
+const ASK_USER_HINT = `\
+## AskUserQuestion Gateway Integration
+
+When the AskUserQuestion tool is denied, the gateway has already captured your questions and presented them to the user via an interactive form. Do not mention errors or denials — simply tell the user you have questions and wait for their response.
+Always set multiSelect to false (only single-select is supported).`;
 
 // ── JSONL protocol types ──────────────────────────────────────
 
@@ -220,14 +231,9 @@ class ClaudeProcess {
     } else {
       args.push('--dangerously-skip-permissions');
     }
-    // Always append the AskUserQuestion hint so the model doesn't mention
-    // "tool denied" errors — the gateway captures the questions from
-    // permission_denials and presents them to the user via an interactive form.
-    const askUserHint =
-      '## AskUserQuestion Gateway Integration\nWhen you use the AskUserQuestion tool and it is denied, the gateway has already captured your questions and will present them to the user via an interactive form. Do not mention any errors or denied tools — the questions have been delivered successfully. Simply tell the user you have some questions for them and wait for their response.\n\nIMPORTANT: Always set multiSelect to false. The gateway only supports single-select dropdowns — never use multi-select questions.';
     const systemPrompt = this.opts.systemPrompt
-      ? `${this.opts.systemPrompt}\n\n${askUserHint}`
-      : askUserHint;
+      ? `${this.opts.systemPrompt}\n\n${ASK_USER_HINT}`
+      : ASK_USER_HINT;
     args.push('--append-system-prompt', systemPrompt);
     return args;
   }
@@ -369,6 +375,8 @@ export class ClaudeCodeAgent implements Agent {
   private _lastUsed = new Map<string, number>();
   /** Persists session IDs so processes can be resumed after idle reap or daemon restart. */
   private _sessionIds = new Map<string, string>();
+  /** Custom tools registered by external modules (e.g. MemoryManager). */
+  private _tools = new Map<string, ToolDefinition>();
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private _flushSessions = createDebouncedFlush(() => {
     try {
@@ -392,6 +400,12 @@ export class ClaudeCodeAgent implements Agent {
     } = {}
   ) {
     this._loadSessions();
+  }
+
+  /** Register a custom tool. Its calls will be intercepted from permission_denials. */
+  registerTool(tool: ToolDefinition): void {
+    this._tools.set(tool.name, tool);
+    log.info(`Custom tool registered: "${tool.name}"`);
   }
 
   // ── Agent interface ───────────────────────────────────────
@@ -419,20 +433,68 @@ export class ClaudeCodeAgent implements Agent {
     const textParts: string[] = [];
     const thinkingParts: string[] = [];
     let resultEvt: ResultEvent | null = null;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCostUsd = 0;
 
-    for await (const evt of this._streamInternal(request)) {
-      if (evt.type === 'content_block_delta') {
-        const delta = (evt as ContentBlockDeltaEvent).delta;
-        if (delta.type === 'text_delta') {
-          textParts.push(delta.text);
-          yield { type: 'text_delta', text: delta.text };
-        } else if (delta.type === 'thinking_delta') {
-          thinkingParts.push(delta.thinking);
-          yield { type: 'thinking_delta', text: delta.thinking };
+    const proc = await this._getOrCreate(request);
+
+    // Outer loop: handle custom tool call → re-send → continue
+    let currentText = request.text;
+    let currentAttachments = request.attachments;
+    let isFirstExchange = true;
+
+    while (true) {
+      const exchange = isFirstExchange
+        ? proc.exchange(currentText, currentAttachments)
+        : proc.exchange(currentText);
+      isFirstExchange = false;
+
+      for await (const evt of exchange) {
+        if (evt.type === 'content_block_delta') {
+          const delta = (evt as ContentBlockDeltaEvent).delta;
+          if (delta.type === 'text_delta') {
+            textParts.push(delta.text);
+            yield { type: 'text_delta', text: delta.text };
+          } else if (delta.type === 'thinking_delta') {
+            thinkingParts.push(delta.thinking);
+            yield { type: 'thinking_delta', text: delta.thinking };
+          }
+        } else if (evt.type === 'result') {
+          resultEvt = evt as ResultEvent;
         }
-      } else if (evt.type === 'result') {
-        resultEvt = evt as ResultEvent;
       }
+
+      if (!resultEvt) break;
+
+      // Accumulate token usage across tool-call rounds
+      totalInputTokens += resultEvt.usage?.input_tokens ?? 0;
+      totalOutputTokens += resultEvt.usage?.output_tokens ?? 0;
+      totalCostUsd += resultEvt.cost_usd ?? 0;
+
+      // Check for custom tool calls in permission_denials
+      const customToolCalls = this._extractCustomToolCalls(resultEvt);
+      if (customToolCalls.length === 0) break;
+
+      // Execute custom tool handlers and send results back
+      const results: string[] = [];
+      for (const call of customToolCalls) {
+        const tool = this._tools.get(call.tool_name)!;
+        try {
+          log.info(
+            `Executing custom tool "${call.tool_name}" with input: ${JSON.stringify(call.tool_input)}`
+          );
+          const result = await tool.handler(call.tool_input);
+          results.push(`[Tool result for ${call.tool_name}]: ${result}`);
+        } catch (err) {
+          results.push(`[Tool result for ${call.tool_name}]: Error: ${err}`);
+        }
+      }
+
+      // Send tool results back as a user message to continue the conversation
+      currentText = results.join('\n\n');
+      currentAttachments = undefined;
+      resultEvt = null;
     }
 
     if (resultEvt?.session_id) {
@@ -461,13 +523,19 @@ export class ClaudeCodeAgent implements Agent {
         text,
         thinking,
         sessionId: resultEvt?.session_id ?? null,
-        costUsd: resultEvt?.cost_usd ?? null,
-        inputTokens: resultEvt?.usage?.input_tokens ?? null,
-        outputTokens: resultEvt?.usage?.output_tokens ?? null,
+        costUsd: totalCostUsd || (resultEvt?.cost_usd ?? null),
+        inputTokens: totalInputTokens || (resultEvt?.usage?.input_tokens ?? null),
+        outputTokens: totalOutputTokens || (resultEvt?.usage?.output_tokens ?? null),
         elapsedMs: Date.now() - t0,
         model: resultEvt?.model ?? null,
       },
     };
+  }
+
+  /** Extract custom tool calls (registered via registerTool) from permission_denials. */
+  private _extractCustomToolCalls(resultEvt: ResultEvent): PermissionDenial[] {
+    if (!resultEvt.permission_denials) return [];
+    return resultEvt.permission_denials.filter((d) => this._tools.has(d.tool_name));
   }
 
   async healthCheck(): Promise<boolean> {
@@ -521,11 +589,6 @@ export class ClaudeCodeAgent implements Agent {
   }
 
   // ── Internals ─────────────────────────────────────────────
-
-  private async *_streamInternal(request: RunRequest): AsyncGenerator<CueEvent> {
-    const proc = await this._getOrCreate(request);
-    yield* proc.exchange(request.text, request.attachments);
-  }
 
   private _conversationCwd(conversationId: string): string | null {
     if (!this.opts.cwd) return null;

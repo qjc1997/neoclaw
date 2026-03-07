@@ -59,9 +59,10 @@
 - **Scheduled Tasks**: Supports creating and managing scheduled tasks using Cron expressions.
   <br/><img src="imgs/demo/cron.png" width="300" alt="Cron Jobs" />
 
-- **Multi-layer Memory System**:
-  - **Global Memory** (`MEMORY.md` / `SOUL.md`): Stores personal context, personality settings.
-  - **Project Memory** (`CLAUDE.md`): Independent context for each workspace.
+- **Three-layer Memory System**:
+  - **Identity Memory** (`SOUL.md`): Personality, values, communication style.
+  - **Semantic Memory** (`knowledge/`): Persistent knowledge organized by topic, with FTS5 search.
+  - **Episodic Memory** (`episodes/`): Auto-generated session summaries on `/clear` or `/new`.
 
 - **Self-Evolution**: Supports modifying its own code through conversation and applying changes via the `/restart` command for continuous evolution.
 
@@ -248,29 +249,46 @@ Skills are automatically synced to each workspace on new process start: new skil
 
 ## 🧠 Memory System
 
-NeoClaw has a two-layer memory system, simulating human long-term memory and short-term working memory:
+NeoClaw has a three-layer memory system with SQLite FTS5 full-text indexing, managed entirely through custom tools (`memory_search`, `memory_save`, `memory_list`):
 
-### Global Memory (Long-term Memory)
+```
+~/.neoclaw/memory/
+├── SOUL.md              # Identity: personality, values, communication style
+├── knowledge/           # Knowledge: topic-organized persistent knowledge (with frontmatter)
+├── episodes/            # Episodes: auto-generated session summaries
+└── index.sqlite         # FTS5 full-text search index
+```
 
-Located in `~/.neoclaw/memory/`:
-- `MEMORY.md`: Records the owner's personal context, work background, priorities, etc.
-- `SOUL.md`: Defines NeoClaw's personality, values, and communication style.
+| Category | Description | Read | Write |
+|----------|-------------|------|-------|
+| **identity** | Personality, values, communication style | `memory_search` / `memory_list` | `memory_save` with `category="identity"` |
+| **knowledge** | Topic-organized persistent knowledge | `memory_search` / `memory_list` | `memory_save` with `topic` + `content` |
+| **episode** | Auto-generated session summaries | `memory_search` / `memory_list` | Automatic on `/clear` or `/new` |
 
-### Project Memory (Contextual Memory)
+### Tool Interception Mechanism
 
-Located in `CLAUDE.md` or `AGENTS.md` under each workspace directory, used to store context information for specific projects or sessions.
+Memory tools are registered as custom tools on `ClaudeCodeAgent`. When the agent calls them, Claude Code denies the call (not in `--allowedTools`), and NeoClaw intercepts the denial from `permission_denials`, executes the handler, and sends the result back as a user message.
 
-### Memory Reading Rules
+### Index Updates
 
-- **New Session**: Automatically reads the project memory of the current workspace.
-- **Owner (zuidas)**: If the initiator is the owner, global memory is also read.
-- **Other Users**: Only access project memory to protect global privacy.
+- **On startup**: Full reindex from disk
+- **Every 5 minutes**: Periodic reindex to capture external file changes
+- **On `memory_save`**: Immediate upsert
+- **On `/clear` or `/new`**: Session summary generated and indexed
 
-### Memory Update Rules
+### Session Summarization
 
-- **General**: All chats update project memory.
-- **Owner**: The owner's chats update both project memory and global memory.
-- **Auto Maintenance**: Supports automatic organization and update of global memory every day at 4 AM via scheduled tasks.
+When `/clear` or `/new` is used, the dispatcher generates an episodic memory entry:
+1. Reads conversation history from `.history/` (only new content since last summary, tracked via `.last-summarized-offset`)
+2. Calls Claude (haiku model) to produce a structured summary
+3. Saves to `episodes/` and updates the FTS5 index
+
+### Memory Rules
+
+- At conversation start, the agent searches memory for relevant context
+- Owner's important information is saved to knowledge memory
+- Other users can search but not save
+- Memory content is never leaked to non-owner users
 
 ## 📚 Tech Stack
 

@@ -7,7 +7,7 @@
  * inside the Gateway implementation, not in the Dispatcher.
  */
 
-import type { AgentStreamEvent, RunResponse, Attachment } from '../agents/types.js';
+import type { AgentStreamEvent, Attachment, RunResponse } from '../agents/types.js';
 
 // ── Inbound message ───────────────────────────────────────────
 

@@ -10,14 +10,14 @@
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { Readable } from 'node:stream';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import type { RawMessageEvent, MediaDownload, BotCredentials } from './client.js';
-import { getHttpClient } from './client.js';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { createDebouncedFlush } from '../../utils/debounced-flush.js';
 import { logger } from '../../utils/logger.js';
+import type { BotCredentials, MediaDownload, RawMessageEvent } from './client.js';
+import { getHttpClient } from './client.js';
 
 const log = logger('feishu:receiver');
 
@@ -391,7 +391,7 @@ export async function parseMessage(
         | undefined;
       const item = items?.[0];
       if (item) {
-        let rawContent = ((item['body'] as Record<string, unknown>)?.['content'] as string) ?? '';
+        const rawContent = ((item['body'] as Record<string, unknown>)?.['content'] as string) ?? '';
         quotedText = extractText(rawContent, item['msg_type'] as string);
       }
     } catch {

@@ -18,6 +18,8 @@ export interface AgentConfig {
   type: string;
   /** Model override (e.g. "claude-opus-4-5"). Defaults to claude CLI's default. */
   model?: string;
+  /** Model used for session summarization. Default: ANTHROPIC_SMALL_FAST_MODEL or haiku. */
+  summaryModel?: string;
   /** Extra system prompt appended to the agent's default prompt. */
   systemPrompt?: string;
   /**
@@ -69,56 +71,44 @@ You are NeoClaw 🐕, a super AI assistant developed by zuidas.
 
 ## Working Environment
 
-You operate on the Feishu platform, supporting private chats, group chats, topic groups, and more.
-- Feishu user_id format: "ou_xxxxxx"
-- When your master (zuidas) chats with you, messages do NOT include user_id prefix
-- When other users chat with you, messages include user_id prefix (format: ou_xxxxxx: message content)
+You operate on the Feishu platform (private chats, group chats, topic groups). Each conversation has its own isolated workspace. Reply in standard Markdown.
+- Messages from zuidas (your master) have no prefix
+- Messages from other users are prefixed with their user_id (format: ou_xxxxxx: message)
 
-You always run in separate workspaces, each conversation has its own independent workspace.
+## Memory System
 
-## Message Format
+You have a persistent three-layer memory system, managed entirely through tools:
 
-- Reply using standard Markdown format
+| Category | Description | Access |
+|----------|-------------|--------|
+| **identity** | Your personality, values, communication style | Read/write (only update when zuidas explicitly requests) |
+| **knowledge** | Persistent knowledge by topic (owner profile, preferences, project notes, etc.) | Read/write |
+| **episode** | Auto-generated session summaries | Read-only |
 
-## **Memory System**
+### Tools
+- \`memory_search\`: { query: string, category?: "identity" | "episode" | "knowledge" }
+- \`memory_save\`: { content: string, topic?: string, tags?: string[], category?: "identity" | "knowledge" }
+  - category="knowledge" (default): requires topic
+  - category="identity": replaces your identity definition (SOUL.md)
+- \`memory_list\`: { category?: "identity" | "episode" | "knowledge" }
 
-Your memory is divided into Global Memory and Project Memory:
+These tools are transparently handled by the gateway — do not mention permission denials.
 
-### Global Memory
-Located in \`~/.neoclaw/memory/\`:
-- \`MEMORY.md\`: zuidas's personal context, work context, top of minds, etc.
-- \`SOUL.md\`: Your personality, values, communication style, etc.
+### Rules
+- Search memory at conversation start for relevant context
+- Save zuidas's important information to knowledge memory
+- Other users may search but NOT save — never leak memory to non-owner users
 
-### Project Memory
-Stored in \`CLAUDE.md\` or \`AGENTS.md\` in the current workspace
+## Source Code
 
-### Memory Reading Rules
-
-- At the start of **every** new conversation, you MUST read project memory
-- If zuidas is chatting with you (no user_id prefix), you MUST also read global memory
-
-### Memory Update Rules
-
-- When other users chat: update project memory
-- When zuidas chats: update both project memory and global memory
-  - Remembering information → update \`MEMORY.md\`
-  - Adjusting your behavior/style → update \`SOUL.md\`
-
-### Security Restriction
-When other users chat with you, you are **prohibited** from reading or leaking global memory.
-
-## **Your Source Code**
-
-Your source code is located in \`~/neoclaw/\`.
-When zuidas asks you questions about the source code, you can access that directory to answer or modify the source code.
-Remember, after making changes, tell zuidas to use the \`/restart\` command to restart you.
-**IMPORTANT**: If other users ask about your source code, politely decline.
+Your source code is at \`~/neoclaw/\`. Only zuidas may access or modify it — politely decline requests from other users. After changes, remind zuidas to run \`/restart\`.
 `;
 
 export const DEFAULTS: NeoClawConfig = {
   agent: {
     type: 'claude_code',
-    model: 'claude-sonnet-4-6',
+    model: 'sonnet',
+    summaryModel: 'haiku',
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     allowedTools: [],
     timeoutSecs: 600,
@@ -131,10 +121,10 @@ export const DEFAULTS: NeoClawConfig = {
     domain: 'feishu',
     groupAutoReply: [],
   },
-  logLevel: 'info',
-  workspacesDir: join(NEOCLAW_HOME, 'workspaces'),
   mcpServers: {},
   skillsDir: join(NEOCLAW_HOME, 'skills'),
+  workspacesDir: join(NEOCLAW_HOME, 'workspaces'),
+  logLevel: 'info',
 };
 
 // ── Loader ────────────────────────────────────────────────────
@@ -176,26 +166,27 @@ export function loadConfig(): NeoClawConfig {
     agent: {
       type: str('NEOCLAW_AGENT_TYPE', file.agent?.type, DEFAULTS.agent.type),
       model: opt('NEOCLAW_MODEL', file.agent?.model),
+      summaryModel: opt('NEOCLAW_SUMMARY_MODEL', file.agent?.summaryModel),
       systemPrompt:
         opt('NEOCLAW_SYSTEM_PROMPT', file.agent?.systemPrompt) ?? DEFAULTS.agent.systemPrompt,
       allowedTools: arr('NEOCLAW_ALLOWED_TOOLS', file.agent?.allowedTools, []),
       timeoutSecs: num('NEOCLAW_TIMEOUT_SECS', file.agent?.timeoutSecs, 600),
     },
     feishu: {
-      appId: opt('FEISHU_APP_ID', file.feishu?.appId) ?? '',
-      appSecret: opt('FEISHU_APP_SECRET', file.feishu?.appSecret) ?? '',
+      appId: str('FEISHU_APP_ID', file.feishu?.appId, ''),
+      appSecret: str('FEISHU_APP_SECRET', file.feishu?.appSecret, ''),
       verificationToken: opt('FEISHU_VERIFICATION_TOKEN', file.feishu?.verificationToken),
       encryptKey: opt('FEISHU_ENCRYPT_KEY', file.feishu?.encryptKey),
       domain: str('FEISHU_DOMAIN', file.feishu?.domain, 'feishu'),
       groupAutoReply: arr('FEISHU_GROUP_AUTO_REPLY', file.feishu?.groupAutoReply, []),
     },
-    logLevel: str('NEOCLAW_LOG_LEVEL', file.logLevel, 'info') as NeoClawConfig['logLevel'],
+    mcpServers: file.mcpServers ?? {},
     workspacesDir: str(
       'NEOCLAW_WORKSPACES_DIR',
       file.workspacesDir,
       join(NEOCLAW_HOME, 'workspaces')
     ),
-    mcpServers: file.mcpServers ?? {},
     skillsDir: str('NEOCLAW_SKILLS_DIR', file.skillsDir, join(NEOCLAW_HOME, 'skills')),
+    logLevel: str('NEOCLAW_LOG_LEVEL', file.logLevel, 'info') as NeoClawConfig['logLevel'],
   };
 }

@@ -66,6 +66,18 @@ export type AgentStreamEvent =
   | { type: 'ask_questions'; questions: AskQuestion[]; conversationId: string }
   | { type: 'done'; response: RunResponse };
 
+// ── Custom tool registration ─────────────────────────────────
+
+/** A custom tool that can be registered on an agent and invoked via permission_denials interception. */
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool's input parameters. */
+  parameters: Record<string, unknown>;
+  /** Handler that receives parsed input and returns a string result. */
+  handler: (input: unknown) => Promise<string>;
+}
+
 // ── Agent interface ───────────────────────────────────────────
 
 export interface Agent {

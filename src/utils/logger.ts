@@ -10,7 +10,7 @@
  * stdout/stderr (useful in dev / foreground mode).
  */
 
-import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 type Level = 'debug' | 'info' | 'warn' | 'error';
@@ -73,7 +73,7 @@ function emit(level: Level, line: string, args: unknown[]): void {
     const date = todayStr();
     if (date !== _currentDate) {
       _currentDate = date;
-      _currentLogPath = join(_logDir, `neoclaw_${date}.log`);
+      _currentLogPath = join(_logDir, `${date}.log`);
     }
     appendFileSync(_currentLogPath, line + serializeArgs(args) + '\n');
   } else {

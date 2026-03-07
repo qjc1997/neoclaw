@@ -9,7 +9,7 @@
  * - Handle built-in slash commands (/clear, /status, /restart, /help)
  */
 
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Agent, AgentStreamEvent, RunRequest, RunResponse } from './agents/types.js';
 import type {
@@ -19,8 +19,9 @@ import type {
   ReplyFn,
   StreamHandler,
 } from './gateway/types.js';
-import { Mutex } from './utils/mutex.js';
+import type { MemoryManager } from './memory/manager.js';
 import { logger } from './utils/logger.js';
+import { Mutex } from './utils/mutex.js';
 
 const log = logger('dispatcher');
 
@@ -37,6 +38,7 @@ export class Dispatcher {
   private _queues = new Map<string, Mutex>();
   private _workspacesDir: string | null = null;
   private _onRestart: RestartCallback | null = null;
+  private _memoryManager: MemoryManager | null = null;
 
   // ── Registration ──────────────────────────────────────────
 
@@ -61,6 +63,11 @@ export class Dispatcher {
   /** Register a callback for when the /restart command is received. */
   onRestart(cb: RestartCallback): void {
     this._onRestart = cb;
+  }
+
+  /** Inject memory manager for session summarization on /clear and /new. */
+  setMemoryManager(mgr: MemoryManager): void {
+    this._memoryManager = mgr;
   }
 
   // ── Handler (passed to gateways) ──────────────────────────
@@ -189,6 +196,12 @@ export class Dispatcher {
     switch (name) {
       case 'clear':
       case 'new': {
+        // Generate session summary before clearing (best-effort, non-blocking on failure)
+        if (this._memoryManager && this._workspacesDir) {
+          await this._memoryManager
+            .summarizeSession(key, this._workspacesDir)
+            .catch((err) => log.warn(`Failed to summarize session: ${err}`));
+        }
         const agent = this._getAgent();
         await agent.clearConversation(key);
         return { text: 'Context cleared, ready for a new conversation.' };
