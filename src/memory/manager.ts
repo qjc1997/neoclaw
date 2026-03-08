@@ -10,12 +10,28 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
-import type { MemoryStore } from './store.js';
+import type { MemoryEntry, MemoryStore } from './store.js';
 import { summarizeTranscript } from './summarizer.js';
 
 const log = logger('memory');
 
 const REINDEX_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Format a memory entry into a structured, readable string. */
+function formatEntry(e: MemoryEntry): string {
+  const tagStr = e.tags.length > 0 ? e.tags.join(', ') : '';
+  return [
+    `id: ${e.id}`,
+    `title: ${e.title}`,
+    `category: ${e.category}`,
+    `date: ${e.date}`,
+    tagStr ? `tags: ${tagStr}` : '',
+    '',
+    e.content,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
 
 export const KNOWLEDGE_TOPICS = {
   'owner-profile': 'Owner personal info, background, career',
@@ -53,8 +69,7 @@ export class MemoryManager {
         return `No memory found with id "${id}".`;
       }
 
-      const tagStr = entry.tags.length > 0 ? ` [${entry.tags.join(', ')}]` : '';
-      return `### ${entry.title}${tagStr}\n**Category**: ${entry.category} | **Date**: ${entry.date}\n\n${entry.content}`;
+      return formatEntry(entry);
     } catch (err) {
       return `Read error: ${err}`;
     }
@@ -77,12 +92,7 @@ export class MemoryManager {
 
       if (results.length === 0) return 'No matching memories found.';
 
-      return results
-        .map((r) => {
-          const tagStr = r.tags.length > 0 ? ` [${r.tags.join(', ')}]` : '';
-          return `### ${r.title}${tagStr}\n**Category**: ${r.category} | **Date**: ${r.date}\n\n${r.content}`;
-        })
-        .join('\n\n---\n\n');
+      return results.map((r) => formatEntry(r)).join('\n\n---\n\n');
     } catch (err) {
       return `Search error: ${err}`;
     }
@@ -91,12 +101,13 @@ export class MemoryManager {
   async handleSave(input: unknown): Promise<string> {
     log.debug(`handleSave: ${JSON.stringify(input, null, 2)}`);
 
-    const { topic, content, tags, category } = input as {
-      topic: string;
-      content: string;
-      tags?: string[];
-      category?: string;
-    };
+    const raw = input as Record<string, unknown>;
+    // Accept both "id" (preferred) and "topic" (legacy) for backward compatibility
+    const id = (raw.id ?? raw.topic) as string | undefined;
+    const content = raw.content as string | undefined;
+    const tags = raw.tags as string[] | undefined;
+    const category = raw.category as string | undefined;
+
     if (!content) {
       log.warn('handleSave: "content" is required.');
       return 'Error: "content" is required.';
@@ -109,19 +120,22 @@ export class MemoryManager {
       let dirName: string;
       let fileName: string;
       let title: string;
+      let entryId: string;
 
       if (category === 'identity') {
         dirName = 'identity';
         fileName = 'SOUL.md';
-        title = topic || 'Soul — Personality & Values';
+        entryId = 'SOUL';
+        title = (id as string) || 'Soul — Personality & Values';
         if (!tagList.length) tagList.push('identity', 'personality');
       } else {
-        if (!topic) return 'Error: "topic" is required for knowledge memory.';
-        if (!(topic in KNOWLEDGE_TOPICS))
-          return `Error: invalid topic "${topic}". Must be one of: ${Object.keys(KNOWLEDGE_TOPICS).join(', ')}`;
+        if (!id) return 'Error: "id" is required for knowledge memory.';
+        if (!(id in KNOWLEDGE_TOPICS))
+          return `Error: invalid id "${id}". Must be one of: ${Object.keys(KNOWLEDGE_TOPICS).join(', ')}`;
         dirName = 'knowledge';
-        fileName = `${topic}.md`;
-        title = KNOWLEDGE_TOPICS[topic as KnowledgeTopic];
+        fileName = `${id}.md`;
+        entryId = id;
+        title = KNOWLEDGE_TOPICS[id as KnowledgeTopic];
       }
 
       const frontmatter = [
@@ -137,9 +151,8 @@ export class MemoryManager {
       if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
       writeFileSync(join(targetDir, fileName), markdown, 'utf-8');
 
-      const id = fileName.replace('.md', '');
       this.store.upsert({
-        id,
+        id: entryId,
         category: category === 'identity' ? 'identity' : 'knowledge',
         title,
         content,
@@ -147,8 +160,8 @@ export class MemoryManager {
         date,
       });
 
-      log.info(`Saved ${category ?? 'knowledge'}: "${id}" (${dirName}/${fileName})`);
-      return `Memory saved: "${id}" (${dirName}/${fileName})`;
+      log.info(`Saved ${category ?? 'knowledge'}: "${entryId}" (${dirName}/${fileName})`);
+      return `Saved: id="${entryId}", category="${category ?? 'knowledge'}", file="${dirName}/${fileName}"`;
     } catch (err) {
       return `Save error: ${err}`;
     }
@@ -167,8 +180,8 @@ export class MemoryManager {
       if (items.length === 0) return 'No memories stored yet.';
 
       const lines = items.map((item) => {
-        const tagStr = item.tags.length > 0 ? ` [${item.tags.join(', ')}]` : '';
-        return `- **${item.title}**${tagStr} (${item.category}, ${item.date})`;
+        const tagStr = item.tags.length > 0 ? `  tags: ${item.tags.join(', ')}` : '';
+        return `- id: ${item.id}  |  title: ${item.title}  |  category: ${item.category}  |  date: ${item.date}${tagStr}`;
       });
       return lines.join('\n');
     } catch (err) {

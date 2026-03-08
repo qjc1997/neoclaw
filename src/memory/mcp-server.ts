@@ -31,14 +31,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_read',
       description:
-        'Read the full content of a specific memory entry by id. Use memory_list to discover available ids.',
+        'Read the full content of a memory entry by id. Use memory_list to discover available ids.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           id: {
             type: 'string',
             description:
-              'Memory entry id (file name without .md extension, e.g. "SOUL", "owner-profile", "preferences")',
+              'Memory entry id (e.g. "SOUL", "owner-profile", "preferences", or an episode id from memory_list)',
           },
         },
         required: ['id'],
@@ -46,15 +46,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'memory_search',
-      description: 'Search through stored memories (identity, knowledge base, and episode history)',
+      description:
+        'Full-text search across all memories (identity, knowledge, episodes). Returns up to 5 matches ranked by relevance. Each result includes id, title, category, date, tags, and content.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          query: { type: 'string', description: 'Search query text' },
+          query: { type: 'string', description: 'Search query text (supports FTS5 syntax)' },
           category: {
             type: 'string',
             enum: ['identity', 'episode', 'knowledge'],
-            description: 'Optional: filter by category',
+            description: 'Filter results to a specific category',
           },
         },
         required: ['query'],
@@ -63,27 +64,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_save',
       description:
-        'Save information to memory. Use category="identity" to update identity/SOUL.md, or omit/use "knowledge" for the knowledge base.',
+        'Save or overwrite a memory entry. For identity: writes to SOUL.md (id is always "SOUL"). For knowledge: writes to knowledge/{id}.md. Episodes cannot be written manually.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          topic: {
+          id: {
             type: 'string',
             enum: Object.keys(KNOWLEDGE_TOPICS),
             description:
-              'Fixed knowledge slot (required for knowledge, ignored for identity): owner-profile (personal info), preferences (habits/workflow), people (contacts), projects (tech decisions), notes (misc)',
+              'Memory entry id — must be one of the fixed knowledge slots: "owner-profile" (personal info), "preferences" (habits/workflow), "people" (contacts), "projects" (tech decisions), "notes" (misc). Ignored when category="identity".',
           },
-          content: { type: 'string', description: 'Markdown content to save' },
+          content: {
+            type: 'string',
+            description: 'Markdown content to save (without frontmatter)',
+          },
           tags: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Optional tags for categorization',
+            description: 'Tags for categorization',
           },
           category: {
             type: 'string',
             enum: ['identity', 'knowledge'],
             description:
-              'Target category. "identity" writes identity/SOUL.md, "knowledge" (default) writes to knowledge/',
+              'Target category. "identity" updates SOUL.md, "knowledge" (default) writes to knowledge/{id}.md',
           },
         },
         required: ['content'],
@@ -91,14 +95,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'memory_list',
-      description: 'List all stored memory entries',
+      description:
+        'List all stored memory entries with their id, title, category, date, and tags. Use this to discover entry ids for memory_read.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           category: {
             type: 'string',
             enum: ['identity', 'episode', 'knowledge'],
-            description: 'Optional: filter by category',
+            description: 'Filter to a specific category',
           },
         },
       },
