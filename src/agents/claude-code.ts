@@ -376,6 +376,9 @@ export class ClaudeCodeAgent implements Agent {
     }
   }, 2000);
 
+  /** Per-conversation model overrides (from config or /model command). */
+  private _modelOverrides = new Map<string, string>();
+
   constructor(
     private readonly opts: {
       model?: string | null;
@@ -384,9 +387,41 @@ export class ClaudeCodeAgent implements Agent {
       cwd?: string | null;
       mcpServers?: Record<string, McpServerConfig>;
       skillsDir?: string | null;
+      modelOverrides?: Record<string, string>;
     } = {}
   ) {
     this._loadSessions();
+    if (opts.modelOverrides) {
+      for (const [key, model] of Object.entries(opts.modelOverrides)) {
+        this._modelOverrides.set(key, model);
+      }
+    }
+  }
+
+  /**
+   * Set or clear the model override for a conversation.
+   * Takes effect on the next subprocess spawn (after idle reap or /clear).
+   * If the conversation has a running process, it is terminated so the new model takes effect immediately.
+   */
+  async setModel(conversationId: string, model: string | null): Promise<void> {
+    if (model) {
+      this._modelOverrides.set(conversationId, model);
+    } else {
+      this._modelOverrides.delete(conversationId);
+    }
+    // Terminate existing process so next request spawns with the new model
+    const proc = this._pool.get(conversationId);
+    if (proc) {
+      await proc.terminate();
+      this._pool.delete(conversationId);
+      this._lastUsed.delete(conversationId);
+    }
+    log.info(`Model override for "${conversationId}": ${model ?? '(default)'}`);
+  }
+
+  /** Get the effective model for a conversation. */
+  getModel(conversationId: string): string | null {
+    return this._modelOverrides.get(conversationId) ?? this.opts.model ?? null;
   }
 
   // ── Agent interface ───────────────────────────────────────
@@ -650,8 +685,9 @@ export class ClaudeCodeAgent implements Agent {
     }
 
     const resumeSessionId = this._sessionIds.get(conversationId);
+    const effectiveModel = this._modelOverrides.get(conversationId) ?? this.opts.model;
     const proc = new ClaudeProcess({
-      model: this.opts.model,
+      model: effectiveModel,
       allowedTools: this.opts.allowedTools,
       systemPrompt: this.opts.systemPrompt ?? null,
       cwd: this._conversationCwd(conversationId),

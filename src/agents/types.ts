@@ -92,6 +92,12 @@ export interface Agent {
   /** Clear the conversation context for a given conversationId. */
   clearConversation(conversationId: string): Promise<void>;
 
+  /** Set or clear the model override for a conversation. Null resets to default. */
+  setModel?(conversationId: string, model: string | null): Promise<void>;
+
+  /** Get the effective model for a conversation. */
+  getModel?(conversationId: string): string | null;
+
   /** Shut down all background processes managed by this agent. */
   dispose(): Promise<void>;
 }

@@ -262,6 +262,7 @@ export class NeoClawDaemon {
 
     const agent = new ClaudeCodeAgent({
       model: this.config.agent.model,
+      modelOverrides: this.config.agent.modelOverrides,
       allowedTools: this.config.agent.allowedTools,
       systemPrompt,
       cwd: this.config.workspacesDir,

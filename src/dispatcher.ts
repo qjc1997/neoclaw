@@ -93,7 +93,7 @@ export class Dispatcher {
       // Slash commands are always non-streaming
       const command = this._tryParseCommand(msg.text);
       if (command) {
-        log.info(`Executing command: ${command}`);
+        log.info(`Executing command: ${command.name}${command.args ? ' ' + command.args : ''}`);
         const response = await this._execCommand(command, msg, key);
         responseText = response.text;
         await reply(response);
@@ -192,17 +192,29 @@ export class Dispatcher {
 
   // ── Built-in slash commands ──────────────────────────────
 
-  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help']);
+  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model']);
 
-  private _tryParseCommand(text: string): string | null {
-    const trimmed = text.trim();
+  private _tryParseCommand(text: string): { name: string; args: string } | null {
+    let trimmed = text.trim();
+    // Strip sender prefix (e.g. "ou_xxx: /model opus" → "/model opus") added by gateways in group chats
+    const prefixMatch = trimmed.match(/^[a-zA-Z0-9_]+:\s*/);
+    if (prefixMatch && !trimmed.startsWith('/')) {
+      trimmed = trimmed.slice(prefixMatch[0].length);
+    }
     if (!trimmed.startsWith('/')) return null;
+    // Strip trailing @mention text (e.g. "/model @_user_1" → "/model")
+    trimmed = trimmed.replace(/@_user_\d+/g, '').trim();
     const end = trimmed.indexOf(' ');
     const name = (end === -1 ? trimmed.slice(1) : trimmed.slice(1, end)).toLowerCase();
-    return Dispatcher.COMMANDS.has(name) ? name : null;
+    const args = end === -1 ? '' : trimmed.slice(end + 1).trim();
+    return Dispatcher.COMMANDS.has(name) ? { name, args } : null;
   }
 
-  private async _execCommand(name: string, msg: InboundMessage, key: string): Promise<RunResponse> {
+  private async _execCommand(
+    { name, args }: { name: string; args: string },
+    msg: InboundMessage,
+    key: string
+  ): Promise<RunResponse> {
     const isThread = key !== msg.chatId;
 
     switch (name) {
@@ -231,21 +243,53 @@ export class Dispatcher {
       }
 
       case 'status': {
+        const agent = this._getAgent();
         const agents = [...this._agents.keys()].join(', ');
         const gateways = this._gateways.map((g) => g.kind).join(', ');
+        const model = agent.getModel ? (agent.getModel(key) ?? 'default') : 'unknown';
         const lines = [
           '**NeoClaw Status**',
           `- Context: ${isThread ? 'Thread (isolated)' : 'Main chat'}`,
+          `- Model: ${model}`,
           `- Agents: ${agents}`,
           `- Gateways: ${gateways}`,
         ];
         return { text: lines.join('\n') };
       }
 
+      case 'model': {
+        const agent = this._getAgent();
+        if (!agent.setModel || !agent.getModel) {
+          return { text: 'Model override is not supported by the current agent.' };
+        }
+        if (!args) {
+          const current = agent.getModel(key) ?? 'default';
+          return {
+            text: [
+              `Current model: **${current}**`,
+              '',
+              'Available models:',
+              '- `sonnet` — Claude Sonnet 4.6 (fast, balanced)',
+              '- `opus` — Claude Opus 4.6 (most capable)',
+              '- `haiku` — Claude Haiku 4.5 (fastest, lightweight)',
+              '',
+              'Usage: `/model <name>` to change, `/model reset` to use default.',
+            ].join('\n'),
+          };
+        }
+        if (args === 'reset' || args === 'default') {
+          await agent.setModel(key, null);
+          return { text: 'Model reset to default. Takes effect on next message.' };
+        }
+        await agent.setModel(key, args);
+        return { text: `Model set to **${args}** for this conversation. Takes effect on next message.` };
+      }
+
       case 'help': {
         const lines = [
           '**Available Commands**',
           '- `/clear` or `/new` — Start a fresh conversation',
+          '- `/model [name]` — Show or change the model for this conversation',
           '- `/status` — Show current session and system info',
           '- `/restart` — Restart the NeoClaw daemon',
           '- `/help` — Show this help message',
