@@ -356,6 +356,7 @@ class ClaudeProcess {
 const IDLE_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
 const CLEANUP_INTERVAL_MS = 60 * 1000; // 1 min
 const SESSIONS_PATH = join(homedir(), '.neoclaw', 'cache', 'sessions.json');
+const MODEL_OVERRIDES_PATH = join(homedir(), '.neoclaw', 'cache', 'model-overrides.json');
 
 export class ClaudeCodeAgent implements Agent {
   readonly kind = 'claude_code';
@@ -376,6 +377,19 @@ export class ClaudeCodeAgent implements Agent {
     }
   }, 2000);
 
+  /** Per-conversation model overrides (from config or /model command). */
+  private _modelOverrides = new Map<string, string>();
+  private _flushModelOverrides = createDebouncedFlush(() => {
+    try {
+      const dir = join(homedir(), '.neoclaw', 'cache');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const data: Record<string, string> = Object.fromEntries(this._modelOverrides);
+      writeFileSync(MODEL_OVERRIDES_PATH, JSON.stringify(data, null, 2));
+    } catch (err) {
+      log.warn(`Failed to flush model overrides: ${err}`);
+    }
+  }, 2000);
+
   constructor(
     private readonly opts: {
       model?: string | null;
@@ -384,9 +398,43 @@ export class ClaudeCodeAgent implements Agent {
       cwd?: string | null;
       mcpServers?: Record<string, McpServerConfig>;
       skillsDir?: string | null;
+      modelOverrides?: Record<string, string>;
     } = {}
   ) {
     this._loadSessions();
+    this._loadModelOverrides();
+    if (opts.modelOverrides) {
+      for (const [key, model] of Object.entries(opts.modelOverrides)) {
+        this._modelOverrides.set(key, model);
+      }
+    }
+  }
+
+  /**
+   * Set or clear the model override for a conversation.
+   * Takes effect on the next subprocess spawn (after idle reap or /clear).
+   * If the conversation has a running process, it is terminated so the new model takes effect immediately.
+   */
+  async setModel(conversationId: string, model: string | null): Promise<void> {
+    if (model) {
+      this._modelOverrides.set(conversationId, model);
+    } else {
+      this._modelOverrides.delete(conversationId);
+    }
+    this._flushModelOverrides();
+    // Terminate existing process so next request spawns with the new model
+    const proc = this._pool.get(conversationId);
+    if (proc) {
+      await proc.terminate();
+      this._pool.delete(conversationId);
+      this._lastUsed.delete(conversationId);
+    }
+    log.info(`Model override for "${conversationId}": ${model ?? '(default)'}`);
+  }
+
+  /** Get the effective model for a conversation. */
+  getModel(conversationId: string): string | null {
+    return this._modelOverrides.get(conversationId) ?? this.opts.model ?? null;
   }
 
   // ── Agent interface ───────────────────────────────────────
@@ -522,6 +570,19 @@ export class ClaudeCodeAgent implements Agent {
     }
   }
 
+  private _loadModelOverrides(): void {
+    try {
+      if (!existsSync(MODEL_OVERRIDES_PATH)) return;
+      const data = JSON.parse(readFileSync(MODEL_OVERRIDES_PATH, 'utf-8')) as Record<string, string>;
+      for (const [id, model] of Object.entries(data)) {
+        this._modelOverrides.set(id, model);
+      }
+      log.info(`Loaded ${this._modelOverrides.size} model override(s) from ${MODEL_OVERRIDES_PATH}`);
+    } catch {
+      // Non-critical — start with empty overrides
+    }
+  }
+
   // ── Internals ─────────────────────────────────────────────
 
   private _conversationCwd(conversationId: string): string | null {
@@ -650,8 +711,9 @@ export class ClaudeCodeAgent implements Agent {
     }
 
     const resumeSessionId = this._sessionIds.get(conversationId);
+    const effectiveModel = this._modelOverrides.get(conversationId) ?? this.opts.model;
     const proc = new ClaudeProcess({
-      model: this.opts.model,
+      model: effectiveModel,
       allowedTools: this.opts.allowedTools,
       systemPrompt: this.opts.systemPrompt ?? null,
       cwd: this._conversationCwd(conversationId),

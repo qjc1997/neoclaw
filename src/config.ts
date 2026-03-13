@@ -18,6 +18,8 @@ export interface AgentConfig {
   type: string;
   /** Model override (e.g. "claude-opus-4-5"). Defaults to claude CLI's default. */
   model?: string;
+  /** Per-conversation model overrides. Keys are chatId or conversationKey, values are model names. */
+  modelOverrides?: Record<string, string>;
   /** Model used for session summarization. Default: ANTHROPIC_SMALL_FAST_MODEL or haiku. */
   summaryModel?: string;
   /** Extra system prompt appended to the agent's default prompt. */
@@ -176,6 +178,7 @@ export function loadConfig(): NeoClawConfig {
     agent: {
       type: str('NEOCLAW_AGENT_TYPE', file.agent?.type, DEFAULTS.agent.type),
       model: opt('NEOCLAW_MODEL', file.agent?.model),
+      modelOverrides: file.agent?.modelOverrides ?? {},
       summaryModel: opt('NEOCLAW_SUMMARY_MODEL', file.agent?.summaryModel),
       systemPrompt:
         opt('NEOCLAW_SYSTEM_PROMPT', file.agent?.systemPrompt) ?? DEFAULTS.agent.systemPrompt,

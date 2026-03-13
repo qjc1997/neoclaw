@@ -349,10 +349,14 @@ export async function parseMessage(
   const client = getHttpClient(creds);
   const rawText = extractText(event.message.content, event.message.message_type);
 
-  if (new Set(['/clear', '/new', 'status', '/restart', '/help']).has(rawText.trim()))
+  log.info(`[cmd-debug] rawText=${JSON.stringify(rawText)}, msgType=${event.message.message_type}`);
+  const cleanText = rawText.trim().replace(/@_user_\d+/g, '').trim();
+  const cmdWord = cleanText.split(/\s/)[0] ?? '';
+  log.info(`[cmd-debug] cleanText=${JSON.stringify(cleanText)}, cmdWord=${JSON.stringify(cmdWord)}`);
+  if (new Set(['/clear', '/new', '/status', '/restart', '/help', '/model']).has(cmdWord))
     return {
       messageId: msgId,
-      text: rawText.trim(),
+      text: cleanText,
       chatId,
       chatType,
       threadRootId,
