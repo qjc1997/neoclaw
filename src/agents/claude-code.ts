@@ -356,6 +356,7 @@ class ClaudeProcess {
 const IDLE_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
 const CLEANUP_INTERVAL_MS = 60 * 1000; // 1 min
 const SESSIONS_PATH = join(homedir(), '.neoclaw', 'cache', 'sessions.json');
+const MODEL_OVERRIDES_PATH = join(homedir(), '.neoclaw', 'cache', 'model-overrides.json');
 
 export class ClaudeCodeAgent implements Agent {
   readonly kind = 'claude_code';
@@ -378,6 +379,16 @@ export class ClaudeCodeAgent implements Agent {
 
   /** Per-conversation model overrides (from config or /model command). */
   private _modelOverrides = new Map<string, string>();
+  private _flushModelOverrides = createDebouncedFlush(() => {
+    try {
+      const dir = join(homedir(), '.neoclaw', 'cache');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const data: Record<string, string> = Object.fromEntries(this._modelOverrides);
+      writeFileSync(MODEL_OVERRIDES_PATH, JSON.stringify(data, null, 2));
+    } catch (err) {
+      log.warn(`Failed to flush model overrides: ${err}`);
+    }
+  }, 2000);
 
   constructor(
     private readonly opts: {
@@ -391,6 +402,7 @@ export class ClaudeCodeAgent implements Agent {
     } = {}
   ) {
     this._loadSessions();
+    this._loadModelOverrides();
     if (opts.modelOverrides) {
       for (const [key, model] of Object.entries(opts.modelOverrides)) {
         this._modelOverrides.set(key, model);
@@ -409,6 +421,7 @@ export class ClaudeCodeAgent implements Agent {
     } else {
       this._modelOverrides.delete(conversationId);
     }
+    this._flushModelOverrides();
     // Terminate existing process so next request spawns with the new model
     const proc = this._pool.get(conversationId);
     if (proc) {
@@ -554,6 +567,19 @@ export class ClaudeCodeAgent implements Agent {
       log.info(`Loaded ${this._sessionIds.size} session(s) from ${SESSIONS_PATH}`);
     } catch {
       // Non-critical — start with empty session map
+    }
+  }
+
+  private _loadModelOverrides(): void {
+    try {
+      if (!existsSync(MODEL_OVERRIDES_PATH)) return;
+      const data = JSON.parse(readFileSync(MODEL_OVERRIDES_PATH, 'utf-8')) as Record<string, string>;
+      for (const [id, model] of Object.entries(data)) {
+        this._modelOverrides.set(id, model);
+      }
+      log.info(`Loaded ${this._modelOverrides.size} model override(s) from ${MODEL_OVERRIDES_PATH}`);
+    } catch {
+      // Non-critical — start with empty overrides
     }
   }
 

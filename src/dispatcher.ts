@@ -281,6 +281,12 @@ export class Dispatcher {
           await agent.setModel(key, null);
           return { text: 'Model reset to default. Takes effect on next message.' };
         }
+        const VALID_MODELS = new Set(['sonnet', 'opus', 'haiku']);
+        if (!VALID_MODELS.has(args)) {
+          return {
+            text: `Unknown model **${args}**. Available: ${[...VALID_MODELS].map((m) => `\`${m}\``).join(', ')}.`,
+          };
+        }
         await agent.setModel(key, args);
         return { text: `Model set to **${args}** for this conversation. Takes effect on next message.` };
       }
