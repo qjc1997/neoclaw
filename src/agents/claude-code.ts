@@ -608,25 +608,42 @@ export class ClaudeCodeAgent implements Agent {
   /** Re-read mcpServers from config file on each process start so changes take effect without daemon restart. */
   private _syncMcpServers(cwd: string): void {
     let mcpServers: Record<string, McpServerConfig> | undefined;
+    let feishuConfig: { appId: string; appSecret: string; domain?: string } | undefined;
     try {
       const freshConfig = loadConfig();
       mcpServers = freshConfig.mcpServers;
+      feishuConfig = freshConfig.feishu;
     } catch {
       mcpServers = this.opts.mcpServers;
     }
 
     // Inject built-in memory MCP server
     const memoryDir = join(homedir(), '.neoclaw', 'memory');
-    const mcpServerScript = join(import.meta.dir, '..', 'memory', 'mcp-server.ts');
+    const memoryMcpScript = join(import.meta.dir, '..', 'memory', 'mcp-server.ts');
     const allServers: Record<string, McpServerConfig> = {
       ...mcpServers,
       'neoclaw-memory': {
         type: 'stdio',
         command: 'bun',
-        args: ['run', mcpServerScript],
+        args: ['run', memoryMcpScript],
         env: { NEOCLAW_MEMORY_DIR: memoryDir },
       },
     };
+
+    // Inject built-in Feishu history MCP server (only if Feishu credentials are configured)
+    if (feishuConfig?.appId && feishuConfig?.appSecret) {
+      const feishuMcpScript = join(import.meta.dir, '..', 'gateway', 'feishu', 'mcp-server.ts');
+      allServers['neoclaw-feishu'] = {
+        type: 'stdio',
+        command: 'bun',
+        args: ['run', feishuMcpScript],
+        env: {
+          FEISHU_APP_ID: feishuConfig.appId,
+          FEISHU_APP_SECRET: feishuConfig.appSecret,
+          FEISHU_DOMAIN: feishuConfig.domain ?? 'feishu',
+        },
+      };
+    }
 
     const mcpPath = join(cwd, '.mcp.json');
     const mcpConfig = { mcpServers: allServers };
