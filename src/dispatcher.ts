@@ -151,6 +151,27 @@ export class Dispatcher {
     }
   }
 
+  /**
+   * Hot-reload: dispose old agents and swap internals without touching gateways.
+   * Gateways keep the same `handle` reference and automatically use the new agent.
+   */
+  async reload(opts: {
+    agent: Agent;
+    defaultAgentKind?: string;
+    workspacesDir?: string;
+    memoryManager?: MemoryManager;
+  }): Promise<void> {
+    for (const agent of this._agents.values()) {
+      await agent.dispose().catch((e) => log.warn(`Agent dispose during reload: ${e}`));
+    }
+    this._agents.clear();
+    this.addAgent(opts.agent);
+    if (opts.defaultAgentKind) this._defaultAgentKind = opts.defaultAgentKind;
+    if (opts.workspacesDir) this._workspacesDir = opts.workspacesDir;
+    if (opts.memoryManager) this._memoryManager = opts.memoryManager;
+    log.info('Dispatcher reloaded');
+  }
+
   /** Proactively send a message to a gateway (e.g. restart notifications). */
   async sendTo(gatewayKind: string, chatId: string, response: RunResponse): Promise<void> {
     const gateway = this._gateways.find((g) => g.kind === gatewayKind);

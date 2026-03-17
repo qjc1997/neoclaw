@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import { ClaudeCodeAgent } from './agents/claude-code.js';
 import type { NeoClawConfig } from './config.js';
-import { NEOCLAW_HOME } from './config.js';
+import { loadConfig, NEOCLAW_HOME } from './config.js';
 import { CronScheduler } from './cron/scheduler.js';
 import { Dispatcher } from './dispatcher.js';
 import { FeishuGateway } from './gateway/feishu/gateway.js';
@@ -58,8 +58,10 @@ const RESTART_NOTIFY_PATH = join(NEOCLAW_HOME, 'cache', 'restart-notify.json');
 export class NeoClawDaemon {
   private _abort = new AbortController();
   private _memoryManager: MemoryManager | null = null;
+  private _memoryStore: MemoryStore | null = null;
+  private _dispatcher: Dispatcher | null = null;
 
-  constructor(private readonly config: NeoClawConfig) {}
+  constructor(private config: NeoClawConfig) {}
 
   // ── Main entry point ──────────────────────────────────────
 
@@ -67,11 +69,14 @@ export class NeoClawDaemon {
     // Self-daemonize: if this is the first launch (not the background child),
     // fork to background with I/O redirected to the log file, then exit.
     if (!process.env['NEOCLAW_DAEMON']) {
+      // Save the real Bun binary path before daemonizing — inside the spawned
+      // child, process.execPath may resolve to a temporary bun-node shim that
+      // can disappear across restarts.
       const child = spawn(process.execPath, process.argv.slice(1), {
         detached: true,
         stdio: 'ignore',
         cwd: process.cwd(),
-        env: { ...process.env, NEOCLAW_DAEMON: '1' },
+        env: { ...process.env, NEOCLAW_DAEMON: '1', NEOCLAW_BUN_PATH: process.execPath },
       });
       child.unref();
       console.log('NeoClaw daemon started in background. Logs:', join(NEOCLAW_HOME, 'logs'));
@@ -87,20 +92,20 @@ export class NeoClawDaemon {
     this._registerSignals();
     this._ensureDirs();
 
-    const dispatcher = await this._buildDispatcher();
-    const scheduler = new CronScheduler(dispatcher);
+    this._dispatcher = await this._buildDispatcher();
+    const scheduler = new CronScheduler(this._dispatcher);
 
     log.info('='.repeat(60));
     log.info(`NeoClaw daemon starting — pid=${process.pid}`);
 
     // Wait a few seconds for gateways to initialize before sending restart notification
-    setTimeout(() => this._sendStartupNotification(dispatcher), 5000);
+    setTimeout(() => this._sendStartupNotification(this._dispatcher!), 5000);
 
     try {
       scheduler.start();
       this._memoryManager?.startPeriodicReindex();
       await Promise.race([
-        dispatcher.start(),
+        this._dispatcher.start(),
         // Resolve when abort is signaled
         new Promise<never>((_, reject) => {
           this._abort.signal.addEventListener('abort', () =>
@@ -113,7 +118,7 @@ export class NeoClawDaemon {
     } finally {
       this._memoryManager?.stopPeriodicReindex();
       scheduler.stop();
-      await dispatcher.stop();
+      await this._dispatcher.stop();
       log.info('NeoClaw daemon stopped.');
     }
   }
@@ -272,8 +277,8 @@ export class NeoClawDaemon {
 
     // Initialize memory system (used for session summarization and periodic reindex)
     const memoryDir = join(NEOCLAW_HOME, 'memory');
-    const memoryStore = new MemoryStore(join(memoryDir, 'index.sqlite'));
-    const memoryManager = new MemoryManager(memoryDir, memoryStore);
+    this._memoryStore = new MemoryStore(join(memoryDir, 'index.sqlite'));
+    const memoryManager = new MemoryManager(memoryDir, this._memoryStore);
     memoryManager.reindex();
     this._memoryManager = memoryManager;
 
@@ -327,22 +332,103 @@ export class NeoClawDaemon {
   // ── Restart ───────────────────────────────────────────────
 
   private _triggerRestart(info: { chatId: string; gatewayKind: string }): void {
-    log.info('Restart requested — forking new process...');
+    this._softRestart(info).catch((err) => {
+      log.error(`Soft restart failed: ${err}, falling back to hard restart`);
+      this._hardRestart(info);
+    });
+  }
+
+  /**
+   * Soft restart: reload config, agent, and memory while keeping gateway
+   * WebSocket connections alive. No new OS process is spawned.
+   */
+  private async _softRestart(info: { chatId: string; gatewayKind: string }): Promise<void> {
+    log.info('Soft restart requested — reloading config and agents...');
+
+    // 1. Fresh config from disk
+    const newConfig = loadConfig();
+
+    // 2. Update log level
+    setLogLevel(newConfig.logLevel ?? 'info');
+
+    // 3. Build cron system prompt and create new agent
+    const cronPrompt = buildCronCliSystemPrompt();
+    const systemPrompt =
+      [newConfig.agent.systemPrompt, cronPrompt].filter(Boolean).join('\n\n') || undefined;
+
+    const agent = new ClaudeCodeAgent({
+      model: newConfig.agent.model,
+      modelOverrides: newConfig.agent.modelOverrides,
+      allowedTools: newConfig.agent.allowedTools,
+      systemPrompt,
+      cwd: newConfig.workspacesDir,
+      mcpServers: newConfig.mcpServers,
+      skillsDir: newConfig.skillsDir,
+    });
+
+    // 4. Stop old memory system
+    this._memoryManager?.stopPeriodicReindex();
+    this._memoryStore?.close();
+
+    // 5. Create new memory system
+    const memoryDir = join(NEOCLAW_HOME, 'memory');
+    this._memoryStore = new MemoryStore(join(memoryDir, 'index.sqlite'));
+    const memoryManager = new MemoryManager(memoryDir, this._memoryStore);
+    memoryManager.reindex();
+    this._memoryManager = memoryManager;
+
+    // 6. Reload dispatcher (disposes old agents, swaps in new ones)
+    await this._dispatcher!.reload({
+      agent,
+      defaultAgentKind: 'claude_code',
+      workspacesDir: newConfig.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
+      memoryManager,
+    });
+
+    // 7. Start new periodic reindex
+    this._memoryManager.startPeriodicReindex();
+
+    // 8. Update stored config
+    this.config = newConfig;
+
+    log.info('Soft restart complete');
+
+    // 9. Notify user
+    await this._dispatcher!.sendTo(info.gatewayKind, info.chatId, {
+      text: 'NeoClaw soft-restarted successfully! (config & agents reloaded, WebSocket kept alive)',
+    });
+  }
+
+  private _hardRestart(info: { chatId: string; gatewayKind: string }): void {
+    log.info('Hard restart requested — forking new process...');
 
     // Persist notification context so the new process can inform the user
     this._saveRestartNotify(info);
+
+    // Use the real Bun binary saved during initial daemonization — process.execPath
+    // inside the daemon may point to a temporary bun-node compatibility shim.
+    const execPath = process.env['NEOCLAW_BUN_PATH'] || process.execPath;
+    const args = process.argv.slice(1);
 
     // Strip Claude Code env vars that would interfere with the child's agent
     const env = { ...process.env };
     delete env['CLAUDECODE'];
 
-    const child = spawn(process.execPath, process.argv.slice(1), {
-      detached: true,
-      stdio: 'ignore',
-      cwd: process.cwd(),
-      env,
-    });
-    child.unref();
+    log.info(`Spawning: ${execPath} ${args.join(' ')} (cwd=${process.cwd()})`);
+
+    try {
+      const child = spawn(execPath, args, {
+        detached: true,
+        stdio: 'ignore',
+        cwd: process.cwd(),
+        env,
+      });
+      child.on('error', (err) => log.error(`Restart child process error: ${err}`));
+      child.unref();
+    } catch (err) {
+      log.error(`Failed to spawn restart process: ${err}`);
+      return;
+    }
 
     // Gracefully shut down the current process
     this._abort.abort();
