@@ -69,6 +69,7 @@ export class FeishuGateway implements Gateway {
 
   private _stopped = false;
   private _handler: MessageHandler | null = null;
+  private _wsClient: import('@larksuiteoapi/node-sdk').WSClient | null = null;
 
   constructor(private readonly _config: FeishuConfig) {}
 
@@ -88,6 +89,10 @@ export class FeishuGateway implements Gateway {
   async stop(): Promise<void> {
     this._stopped = true;
     this._handler = null;
+    if (this._wsClient) {
+      this._wsClient.close();
+      this._wsClient = null;
+    }
     log.info('Feishu gateway stopped');
   }
 
@@ -175,8 +180,8 @@ export class FeishuGateway implements Gateway {
       },
     } as Parameters<typeof dispatcher.register>[0]);
 
-    const wsClient = getWsClient(creds);
-    wsClient.start({ eventDispatcher: dispatcher });
+    this._wsClient = getWsClient(creds);
+    this._wsClient.start({ eventDispatcher: dispatcher });
     log.info('WebSocket client started');
   }
 
