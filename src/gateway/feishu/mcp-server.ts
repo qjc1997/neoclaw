@@ -85,6 +85,14 @@ function extractRichText(content: string): string {
   }
 }
 
+// ── ID helpers ───────────────────────────────────────────────
+
+function receiveIdType(id: string): 'chat_id' | 'open_id' | 'user_id' {
+  if (id.startsWith('oc_')) return 'chat_id';
+  if (id.startsWith('ou_')) return 'open_id';
+  return 'user_id';
+}
+
 // ── Feishu API helpers ───────────────────────────────────────
 
 type MessageItem = {
@@ -181,6 +189,112 @@ async function fetchHistory(opts: {
   return { messages: formatted, hasMore: allItems.length >= opts.count };
 }
 
+// ── File upload & send ────────────────────────────────────────
+
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+
+async function getTenantAccessToken(): Promise<string> {
+  const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  });
+  const json = await res.json() as { code: number; tenant_access_token?: string; msg?: string };
+  if (json.code !== 0 || !json.tenant_access_token) {
+    throw new Error(`Failed to get access token: ${json.code} ${json.msg ?? ''}`);
+  }
+  return json.tenant_access_token;
+}
+
+async function uploadAndSendFile(opts: {
+  chatId: string;
+  filePath: string;
+  fileName?: string;
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { basename, extname } = await import('node:path');
+
+  if (!existsSync(opts.filePath)) {
+    return { success: false, error: `File not found: ${opts.filePath}` };
+  }
+
+  const fileName = opts.fileName || basename(opts.filePath);
+  const ext = extname(fileName).toLowerCase();
+  const isImage = IMAGE_EXTS.has(ext);
+
+  try {
+    const token = await getTenantAccessToken();
+    const fileBuffer = readFileSync(opts.filePath);
+    const blob = new Blob([fileBuffer]);
+
+    let resourceKey: string;
+    let msgType: string;
+    let contentKey: string;
+
+    if (isImage) {
+      const form = new FormData();
+      form.append('image_type', 'message');
+      form.append('image', blob, fileName);
+
+      const uploadRes = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const uploadJson = await uploadRes.json() as { code: number; msg?: string; data?: { image_key?: string } };
+      if (uploadJson.code !== 0 || !uploadJson.data?.image_key) {
+        return { success: false, error: `Image upload failed: ${uploadJson.code} ${uploadJson.msg ?? ''}` };
+      }
+      resourceKey = uploadJson.data.image_key;
+      msgType = 'image';
+      contentKey = 'image_key';
+    } else {
+      const fileTypeMap: Record<string, string> = { '.mp4': 'mp4', '.pdf': 'pdf', '.opus': 'opus' };
+      const fileType = fileTypeMap[ext] ?? 'stream';
+
+      const form = new FormData();
+      form.append('file_type', fileType);
+      form.append('file_name', fileName);
+      form.append('file', blob, fileName);
+
+      const uploadRes = await fetch('https://open.feishu.cn/open-apis/im/v1/files', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const uploadJson = await uploadRes.json() as { code: number; msg?: string; data?: { file_key?: string } };
+      if (uploadJson.code !== 0 || !uploadJson.data?.file_key) {
+        return { success: false, error: `File upload failed: ${uploadJson.code} ${uploadJson.msg ?? ''}` };
+      }
+      resourceKey = uploadJson.data.file_key;
+      msgType = 'file';
+      contentKey = 'file_key';
+    }
+
+    // Send message
+    const sendRes = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType(opts.chatId)}`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          receive_id: opts.chatId,
+          msg_type: msgType,
+          content: JSON.stringify({ [contentKey]: resourceKey }),
+        }),
+      }
+    );
+    const sendJson = await sendRes.json() as { code: number; msg?: string; data?: { message_id?: string } };
+    return {
+      success: sendJson.code === 0,
+      messageId: sendJson.data?.message_id,
+      error: sendJson.code !== 0 ? `${sendJson.code}: ${sendJson.msg ?? ''}` : undefined,
+    };
+  } catch (err) {
+    return { success: false, error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 // ── MCP Server ───────────────────────────────────────────────
 
 const server = new Server(
@@ -190,6 +304,31 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: 'feishu_send_file',
+      description:
+        'Upload a local file and send it to a Feishu chat. Supports images (jpg, jpeg, png, gif, webp) and general files (pdf, mp4, opus, and others). The file is uploaded to Feishu and delivered as a native file/image message.',
+      inputSchema: {
+        type: 'object' as const,
+        required: ['file_path'],
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Absolute path to the local file to upload and send.',
+          },
+          file_name: {
+            type: 'string',
+            description:
+              'Optional display name for the file. Defaults to the filename from file_path.',
+          },
+          chat_id: {
+            type: 'string',
+            description:
+              'Feishu chat ID (starts with "oc_"). If omitted, sends to the current chat.',
+          },
+        },
+      },
+    },
     {
       name: 'feishu_get_history',
       description:
@@ -224,6 +363,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === 'feishu_send_file') {
+    const filePath = args?.['file_path'] as string;
+    if (!filePath) {
+      return { content: [{ type: 'text', text: 'Error: file_path is required.' }] };
+    }
+    const chatId = (args?.['chat_id'] as string) || currentChatId;
+    if (!chatId) {
+      return { content: [{ type: 'text', text: 'Error: No chat_id provided and NEOCLAW_CHAT_ID is not set.' }] };
+    }
+    const fileName = args?.['file_name'] as string | undefined;
+    const result = await uploadAndSendFile({ chatId, filePath, fileName });
+    if (!result.success) {
+      return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    }
+    return { content: [{ type: 'text', text: `File sent successfully. Message ID: ${result.messageId ?? 'unknown'}` }] };
+  }
 
   if (name !== 'feishu_get_history') {
     return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
