@@ -295,6 +295,115 @@ async function uploadAndSendFile(opts: {
   }
 }
 
+// ── Document reading ─────────────────────────────────────────
+
+/**
+ * Parse a Feishu URL to extract the token and type.
+ * Supported URL formats:
+ * - https://xxx.feishu.cn/wiki/AbCdEfGhIjKlMnOpQrStUvWxYz
+ * - https://xxx.feishu.cn/docx/AbCdEfGhIjKlMnOpQrStUvWxYz
+ * - https://xxx.feishu.cn/docs/AbCdEfGhIjKlMnOpQrStUvWxYz
+ * - Plain token string
+ */
+function parseDocInput(input: string): { token: string; type: 'wiki' | 'docx' | 'doc' | 'unknown' } {
+  const trimmed = input.trim();
+
+  // Try to parse as URL
+  const wikiMatch = trimmed.match(/\/wiki\/([A-Za-z0-9]+)/);
+  if (wikiMatch) return { token: wikiMatch[1], type: 'wiki' };
+
+  const docxMatch = trimmed.match(/\/docx\/([A-Za-z0-9]+)/);
+  if (docxMatch) return { token: docxMatch[1], type: 'docx' };
+
+  const docMatch = trimmed.match(/\/docs\/([A-Za-z0-9]+)/);
+  if (docMatch) return { token: docMatch[1], type: 'doc' };
+
+  // Plain token
+  return { token: trimmed, type: 'unknown' };
+}
+
+/**
+ * Resolve a wiki node token to its underlying document token and type.
+ */
+async function resolveWikiNode(token: string, accessToken: string): Promise<{ objToken: string; objType: string } | { error: string }> {
+  const res = await fetch(
+    `https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token=${encodeURIComponent(token)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const json = await res.json() as {
+    code: number;
+    msg?: string;
+    data?: { node?: { obj_token?: string; obj_type?: string; title?: string } };
+  };
+  if (json.code !== 0) {
+    return { error: `Wiki API error ${json.code}: ${json.msg ?? ''}` };
+  }
+  const node = json.data?.node;
+  if (!node?.obj_token || !node?.obj_type) {
+    return { error: 'Wiki node not found or missing obj_token/obj_type' };
+  }
+  return { objToken: node.obj_token, objType: node.obj_type };
+}
+
+/**
+ * Read a docx document's raw text content.
+ */
+async function readDocxContent(docToken: string, accessToken: string): Promise<{ content: string } | { error: string }> {
+  const res = await fetch(
+    `https://open.feishu.cn/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}/raw_content`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const json = await res.json() as {
+    code: number;
+    msg?: string;
+    data?: { content?: string };
+  };
+  if (json.code !== 0) {
+    return { error: `Docx API error ${json.code}: ${json.msg ?? ''}` };
+  }
+  return { content: json.data?.content ?? '' };
+}
+
+/**
+ * Read a document: resolve wiki if needed, then fetch content.
+ */
+async function readDocument(input: string): Promise<{ content: string; error?: string }> {
+  if (!appId || !appSecret) {
+    return { content: '', error: 'Feishu credentials not configured' };
+  }
+
+  try {
+    const accessToken = await getTenantAccessToken();
+    const parsed = parseDocInput(input);
+    let docToken = parsed.token;
+
+    // If it's a wiki URL/token, resolve to the underlying document
+    if (parsed.type === 'wiki' || parsed.type === 'unknown') {
+      const resolved = await resolveWikiNode(parsed.token, accessToken);
+      if ('error' in resolved) {
+        // If type was 'unknown', try reading as docx directly
+        if (parsed.type === 'unknown') {
+          const result = await readDocxContent(parsed.token, accessToken);
+          if ('error' in result) return { content: '', error: `Could not resolve as wiki or docx: ${resolved.error} / ${result.error}` };
+          return { content: result.content };
+        }
+        return { content: '', error: resolved.error };
+      }
+      docToken = resolved.objToken;
+      // Currently only docx is supported for content reading
+      if (resolved.objType !== 'docx' && resolved.objType !== 'doc') {
+        return { content: '', error: `Unsupported document type: ${resolved.objType}. Only docx/doc types are supported.` };
+      }
+    }
+
+    const result = await readDocxContent(docToken, accessToken);
+    if ('error' in result) return { content: '', error: result.error };
+    return { content: result.content };
+  } catch (err) {
+    return { content: '', error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 // ── MCP Server ───────────────────────────────────────────────
 
 const server = new Server(
@@ -325,6 +434,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description:
               'Feishu chat ID (starts with "oc_"). If omitted, sends to the current chat.',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_read_document',
+      description:
+        'Read the content of a Feishu document or wiki page. Accepts a full Feishu URL (e.g. https://xxx.feishu.cn/wiki/xxx or https://xxx.feishu.cn/docx/xxx) or a plain document/wiki token. For wiki pages, automatically resolves to the underlying document. Returns the document text content.',
+      inputSchema: {
+        type: 'object' as const,
+        required: ['url_or_token'],
+        properties: {
+          url_or_token: {
+            type: 'string',
+            description:
+              'Feishu document URL or token. Supported formats: wiki URL, docx URL, doc URL, or plain token string.',
           },
         },
       },
@@ -379,6 +504,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
     }
     return { content: [{ type: 'text', text: `File sent successfully. Message ID: ${result.messageId ?? 'unknown'}` }] };
+  }
+
+  if (name === 'feishu_read_document') {
+    const urlOrToken = args?.['url_or_token'] as string;
+    if (!urlOrToken) {
+      return { content: [{ type: 'text', text: 'Error: url_or_token is required.' }] };
+    }
+    const result = await readDocument(urlOrToken);
+    if (result.error) {
+      return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    }
+    if (!result.content) {
+      return { content: [{ type: 'text', text: 'Document is empty or has no readable content.' }] };
+    }
+    return { content: [{ type: 'text', text: result.content }] };
   }
 
   if (name !== 'feishu_get_history') {
