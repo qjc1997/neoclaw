@@ -286,6 +286,9 @@ export class NeoClawDaemon {
     dispatcher.setDefaultAgent('claude_code');
     dispatcher.setWorkspacesDir(this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'));
     dispatcher.setMemoryManager(memoryManager);
+    if (this.config.speech) {
+      dispatcher.setSpeechConfig(this.config.speech);
+    }
 
     // Register Feishu gateway if credentials are present
     if (this.config.feishu.appId && this.config.feishu.appSecret) {
@@ -383,6 +386,7 @@ export class NeoClawDaemon {
       defaultAgentKind: 'claude_code',
       workspacesDir: newConfig.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
       memoryManager,
+      speechConfig: newConfig.speech,
     });
 
     // 7. Start new periodic reindex

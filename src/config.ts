@@ -71,6 +71,8 @@ export interface NeoClawConfig {
   wework?: WeworkConfig;
   /** MCP servers to expose to agents. Keyed by server name. */
   mcpServers?: Record<string, McpServerConfig>;
+  /** Speech processing configuration (optional). Enables audio transcription and pronunciation assessment. */
+  speech?: import('./speech/types.js').SpeechConfig;
   /** Directory for agent workspaces. Default: ~/.neoclaw/workspaces. */
   workspacesDir?: string;
   /** Directory containing skill subdirectories. Default: ~/.neoclaw/skills. */
@@ -111,8 +113,8 @@ You have a persistent three-layer memory system, managed through MCP tools (\`me
 ### Rules
 - Search memory when context seems relevant (e.g. the user references prior conversations, personal preferences, or ongoing projects)
 - Before saving, use \`memory_read\` to read the current content first, then merge changes to avoid overwriting existing data
-- Save the bot owner's important information to knowledge memory (pick the most appropriate fixed slot)
-- Other users may search but NOT save — never leak memory to non-owner users
+- Save important information to knowledge memory (pick the most appropriate fixed slot)
+- All users may search and save to memory
 
 ## Source Code
 

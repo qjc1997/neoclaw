@@ -20,10 +20,18 @@ import type {
   StreamHandler,
 } from './gateway/types.js';
 import type { MemoryManager } from './memory/manager.js';
+import { SpeechProcessor } from './speech/index.js';
+import type { SpeechConfig } from './speech/index.js';
 import { logger } from './utils/logger.js';
 import { Mutex } from './utils/mutex.js';
 
 const log = logger('dispatcher');
+
+/** Token threshold for context usage warning (140K tokens). */
+const CONTEXT_WARNING_THRESHOLD = 140_000;
+
+const CONTEXT_WARNING_MSG =
+  '\n\n---\n⚠️ **上下文使用量已超过 140K tokens，建议尽快使用 `/compress` 压缩会话，避免上下文溢出导致信息丢失。**';
 
 // ── Dispatcher ────────────────────────────────────────────────
 
@@ -39,6 +47,7 @@ export class Dispatcher {
   private _workspacesDir: string | null = null;
   private _memoryManager: MemoryManager | null = null;
   private _onRestart: RestartCallback | null = null;
+  private _speechProcessor: SpeechProcessor | null = null;
 
   // ── Registration ──────────────────────────────────────────
 
@@ -74,6 +83,12 @@ export class Dispatcher {
     log.info('Restart callback set');
   }
 
+  /** Configure speech processing for audio attachments. */
+  setSpeechConfig(config: SpeechConfig): void {
+    this._speechProcessor = new SpeechProcessor(config);
+    log.info(`Speech processor configured: backend=${config.backend}`);
+  }
+
   // ── Handler (passed to gateways) ──────────────────────────
 
   readonly handle: MessageHandler = async (
@@ -98,9 +113,28 @@ export class Dispatcher {
         responseText = response.text;
         await reply(response);
       } else {
+        // Process audio attachments through speech backend if configured
+        let processedText = msg.text;
+        if (this._speechProcessor && msg.attachments?.some((a) => a.mediaType === 'audio')) {
+          const audioAttachments = msg.attachments.filter((a) => a.mediaType === 'audio');
+          const results = await Promise.allSettled(
+            audioAttachments.map((a) => this._speechProcessor!.process(a.buffer))
+          );
+          for (const result of results) {
+            if (result.status === 'fulfilled') {
+              processedText += `\n\n${SpeechProcessor.formatResult(result.value)}`;
+              log.info(`Audio processed: "${result.value.transcript.slice(0, 80)}..."`);
+            } else {
+              const err = result.reason;
+              log.error(`Speech processing failed: ${err}`);
+              processedText += `\n\n[Speech processing error: ${err instanceof Error ? err.message : String(err)}]`;
+            }
+          }
+        }
+
         const agent = this._getAgent();
         const request: RunRequest = {
-          text: msg.text,
+          text: processedText,
           conversationId: key,
           chatId: msg.chatId,
           gatewayKind: msg.gatewayKind,
@@ -111,8 +145,21 @@ export class Dispatcher {
           // Streaming path: gateway renders content progressively
           const agentStream = agent.stream(request);
           async function* tracked(): AsyncGenerator<AgentStreamEvent> {
-            for await (const event of agentStream) {
-              if (event.type === 'done') responseText = event.response.text;
+            for await (let event of agentStream) {
+              if (event.type === 'done') {
+                const inputTokens = event.response.inputTokens ?? 0;
+                if (inputTokens >= CONTEXT_WARNING_THRESHOLD) {
+                  event = {
+                    ...event,
+                    response: {
+                      ...event.response,
+                      text: event.response.text + CONTEXT_WARNING_MSG,
+                    },
+                  };
+                  log.warn(`Context usage ${inputTokens} tokens exceeds threshold for "${key}"`);
+                }
+                responseText = event.response.text;
+              }
               yield event;
             }
           }
@@ -120,6 +167,10 @@ export class Dispatcher {
         } else {
           // Non-streaming fallback
           const response = await agent.run(request);
+          if ((response.inputTokens ?? 0) >= CONTEXT_WARNING_THRESHOLD) {
+            response.text += CONTEXT_WARNING_MSG;
+            log.warn(`Context usage ${response.inputTokens} tokens exceeds threshold for "${key}"`);
+          }
           responseText = response.text;
           await reply(response);
         }
@@ -160,6 +211,7 @@ export class Dispatcher {
     defaultAgentKind?: string;
     workspacesDir?: string;
     memoryManager?: MemoryManager;
+    speechConfig?: SpeechConfig;
   }): Promise<void> {
     for (const agent of this._agents.values()) {
       await agent.dispose().catch((e) => log.warn(`Agent dispose during reload: ${e}`));
@@ -169,6 +221,7 @@ export class Dispatcher {
     if (opts.defaultAgentKind) this._defaultAgentKind = opts.defaultAgentKind;
     if (opts.workspacesDir) this._workspacesDir = opts.workspacesDir;
     if (opts.memoryManager) this._memoryManager = opts.memoryManager;
+    if (opts.speechConfig) this.setSpeechConfig(opts.speechConfig);
     log.info('Dispatcher reloaded');
   }
 
@@ -213,7 +266,7 @@ export class Dispatcher {
 
   // ── Built-in slash commands ──────────────────────────────
 
-  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model']);
+  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model', 'compress']);
 
   private _tryParseCommand(text: string): { name: string; args: string } | null {
     let trimmed = text.trim();
@@ -312,10 +365,29 @@ export class Dispatcher {
         return { text: `Model set to **${args}** for this conversation. Takes effect on next message.` };
       }
 
+      case 'compress': {
+        // 1. Summarize current session into episodic memory
+        let summaryNote = '';
+        if (this._memoryManager && this._workspacesDir) {
+          try {
+            await this._memoryManager.summarizeSession(key, this._workspacesDir);
+            summaryNote = 'Session summary saved. ';
+          } catch (err) {
+            log.warn(`Failed to summarize session during compress: ${err}`);
+            summaryNote = 'Summary failed, but context will still be cleared. ';
+          }
+        }
+        // 2. Clear conversation (terminate subprocess, drop session ID)
+        const compressAgent = this._getAgent();
+        await compressAgent.clearConversation(key);
+        return { text: `${summaryNote}Context compressed and cleared, ready for a new conversation.` };
+      }
+
       case 'help': {
         const lines = [
           '**Available Commands**',
           '- `/clear` or `/new` — Start a fresh conversation',
+          '- `/compress` — Summarize and compress the current session',
           '- `/model [name]` — Show or change the model for this conversation',
           '- `/status` — Show current session and system info',
           '- `/restart` — Restart the NeoClaw daemon',
