@@ -46,7 +46,7 @@ export class AzureProvider implements SpeechProvider {
     return this._transcribe(audio, language, mime);
   }
 
-  private async _transcribe(audio: Buffer, language: string, mime?: string): Promise<SpeechResult> {
+  private async _transcribe(audio: Buffer, language: string, mime: string): Promise<SpeechResult> {
     const url = `https://${this.region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${language}&format=detailed`;
 
     log.info(`Azure transcription: ${audio.length} bytes, language=${language}`);
@@ -87,7 +87,7 @@ export class AzureProvider implements SpeechProvider {
     audio: Buffer,
     language: string,
     referenceText: string,
-    mime?: string
+    mime: string
   ): Promise<SpeechResult> {
     const pronunciationConfig = {
       ReferenceText: referenceText,
@@ -107,7 +107,7 @@ export class AzureProvider implements SpeechProvider {
       method: 'POST',
       headers: {
         'Ocp-Apim-Subscription-Key': this.subscriptionKey,
-        'Content-Type': mime ?? 'audio/mp4',
+        'Content-Type': mime,
         Accept: 'application/json',
         'Pronunciation-Assessment': Buffer.from(
           JSON.stringify(pronunciationConfig)
