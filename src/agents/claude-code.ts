@@ -382,6 +382,12 @@ export class ClaudeCodeAgent implements Agent {
 
   private _pool = new Map<string, ClaudeProcess>();
   private _lastUsed = new Map<string, number>();
+  /**
+   * Conversations currently streaming a response. Guards against the idle
+   * reaper killing a long-running subprocess (any run > IDLE_TIMEOUT_MS would
+   * otherwise be terminated mid-stream — see `_reapIdleProcesses`).
+   */
+  private _active = new Set<string>();
   /** Persists session IDs so processes can be resumed after idle reap or daemon restart. */
   private _sessionIds = new Map<string, string>();
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -484,24 +490,35 @@ export class ClaudeCodeAgent implements Agent {
 
     const proc = await this._getOrCreate(request);
 
-    for await (const evt of proc.exchange(request.text, request.attachments)) {
-      if (evt.type === 'assistant') {
-        // CLI outputs full assistant message events (not incremental deltas)
-        const blocks = (evt as AssistantEvent).message.content;
-        for (const block of blocks) {
-          if (block.type === 'thinking') {
-            thinkingParts.push(block.thinking);
-            yield { type: 'thinking_delta', text: block.thinking };
-          } else if (block.type === 'tool_use') {
-            yield { type: 'tool_use', name: block.name, input: block.input };
-          } else if (block.type === 'text') {
-            textParts.push(block.text);
-            yield { type: 'text_delta', text: block.text };
+    // Mark active so the idle reaper won't kill this subprocess mid-stream
+    // even if the response takes longer than IDLE_TIMEOUT_MS.
+    this._active.add(request.conversationId);
+    try {
+      for await (const evt of proc.exchange(request.text, request.attachments)) {
+        // Defensive: keep lastUsed fresh on every CLI event so that if _active
+        // tracking is ever bypassed, the reaper still sees recent activity.
+        this._lastUsed.set(request.conversationId, Date.now());
+        if (evt.type === 'assistant') {
+          // CLI outputs full assistant message events (not incremental deltas)
+          const blocks = (evt as AssistantEvent).message.content;
+          for (const block of blocks) {
+            if (block.type === 'thinking') {
+              thinkingParts.push(block.thinking);
+              yield { type: 'thinking_delta', text: block.thinking };
+            } else if (block.type === 'tool_use') {
+              yield { type: 'tool_use', name: block.name, input: block.input };
+            } else if (block.type === 'text') {
+              textParts.push(block.text);
+              yield { type: 'text_delta', text: block.text };
+            }
           }
+        } else if (evt.type === 'result') {
+          resultEvt = evt as ResultEvent;
         }
-      } else if (evt.type === 'result') {
-        resultEvt = evt as ResultEvent;
       }
+    } finally {
+      this._active.delete(request.conversationId);
+      this._lastUsed.set(request.conversationId, Date.now());
     }
 
     if (resultEvt?.session_id) {
@@ -584,6 +601,7 @@ export class ClaudeCodeAgent implements Agent {
     await Promise.all([...this._pool.values()].map((p) => p.terminate()));
     this._pool.clear();
     this._lastUsed.clear();
+    this._active.clear();
     // Clear _sessionIds in memory but do NOT flush — the persisted file is kept
     // intact so the next daemon process can resume sessions after a restart.
     this._sessionIds.clear();
@@ -792,9 +810,26 @@ export class ClaudeCodeAgent implements Agent {
 
   private async _reapIdleProcesses(): Promise<void> {
     const cutoff = Date.now() - IDLE_TIMEOUT_MS;
-    const stale = [...this._lastUsed.entries()].filter(([, ts]) => ts < cutoff).map(([id]) => id);
+    const stale = [...this._lastUsed.entries()]
+      // Skip conversations with an in-flight stream — reaping them would kill
+      // the subprocess mid-response, producing a truncated reply with no
+      // result event and losing the updated session_id.
+      .filter(([id, ts]) => ts < cutoff && !this._active.has(id))
+      .map(([id]) => id);
 
     for (const id of stale) {
+      // Re-check before terminate: the filter above was a synchronous snapshot,
+      // but the await in this loop yields the event loop. A new message for
+      // this id (hitting an idle-pooled proc) can arrive between snapshot and
+      // here, running _getOrCreate + _active.add before we get the chance to
+      // kill it. Without this re-check a freshly-started stream would be
+      // silently terminated — exactly the bug _active was introduced to fix.
+      // Also re-check _lastUsed: _getOrCreate bumps it for existing procs, so
+      // a fresh timestamp means the conversation is live even if we haven't
+      // yet observed _active.add (tiny microtask window between the two).
+      if (this._active.has(id)) continue;
+      const lastUsed = this._lastUsed.get(id);
+      if (lastUsed !== undefined && lastUsed >= cutoff) continue;
       log.info(`Reaping idle process for conversation "${id}"`);
       await this._pool.get(id)?.terminate();
       this._pool.delete(id);
