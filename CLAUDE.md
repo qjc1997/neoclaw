@@ -27,7 +27,7 @@ Gateway.start(dispatcher.handle)
 1. Gateway receives a raw platform event, parses it into `InboundMessage`, creates a `reply` closure and a `streamHandler` closure with protocol context bound
 2. Gateway calls `dispatcher.handle(msg, reply, streamHandler)`
 3. Dispatcher acquires a per-conversation `SerialQueue` lock to prevent race conditions
-4. Checks for slash commands (`/clear`, `/restart`, `/status`, `/help`) — always use non-streaming `reply()`
+4. Checks for slash commands (`/clear`, `/restart`, `/status`, `/stop`, `/help`) — always use non-streaming `reply()`. Note: `/stop` bypasses the per-conversation mutex via a fast-path in `handle()` so it can abort the stream that holds the lock; it calls `agent.cancel(conversationId)` which terminates the subprocess but preserves `_sessionIds` so the next message resumes.
 5. If `streamHandler` is provided and agent has `stream()`, uses streaming path; otherwise falls back to `agent.run()` + `reply()`
 6. Gateway's `streamHandler` renders content progressively as events arrive
 
@@ -85,7 +85,8 @@ Key config fields (`~/.neoclaw/config.json`):
     "verificationToken": "",
     "encryptKey": "",
     "domain": "feishu",           // "feishu", "lark", or custom base URL
-    "groupAutoReply": []          // chat IDs for auto-reply without @mention
+    "groupAutoReply": [],         // chat IDs for auto-reply without @mention
+    "owners": []                  // open_id whitelist — owner messages skip the `ou_xxx:` prefix so the agent recognizes them as the bot owner
   },
   "mcpServers": {                 // MCP servers exposed to agents (hot-reloaded)
     "server-name": {
@@ -101,7 +102,7 @@ Key config fields (`~/.neoclaw/config.json`):
 }
 ```
 
-Env var overrides: `NEOCLAW_AGENT_TYPE`, `NEOCLAW_MODEL`, `NEOCLAW_SYSTEM_PROMPT`, `NEOCLAW_ALLOWED_TOOLS`, `NEOCLAW_TIMEOUT_SECS`, `NEOCLAW_LOG_LEVEL`, `NEOCLAW_WORKSPACES_DIR`, `NEOCLAW_SKILLS_DIR`, `NEOCLAW_CONFIG` (config file path), `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_VERIFICATION_TOKEN`, `FEISHU_ENCRYPT_KEY`, `FEISHU_DOMAIN`, `FEISHU_GROUP_AUTO_REPLY`.
+Env var overrides: `NEOCLAW_AGENT_TYPE`, `NEOCLAW_MODEL`, `NEOCLAW_SYSTEM_PROMPT`, `NEOCLAW_ALLOWED_TOOLS`, `NEOCLAW_TIMEOUT_SECS`, `NEOCLAW_LOG_LEVEL`, `NEOCLAW_WORKSPACES_DIR`, `NEOCLAW_SKILLS_DIR`, `NEOCLAW_CONFIG` (config file path), `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_VERIFICATION_TOKEN`, `FEISHU_ENCRYPT_KEY`, `FEISHU_DOMAIN`, `FEISHU_GROUP_AUTO_REPLY`, `FEISHU_OWNERS`, `WEWORK_BOT_ID`, `WEWORK_SECRET`, `WEWORK_WEBSOCKET_URL`, `WEWORK_GROUP_AUTO_REPLY`, `WEWORK_OWNERS`.
 
 **MCP & Skills workspace sync** (`ClaudeCodeAgent._prepareWorkspace()`): Runs each time a new Claude Code subprocess starts. `_syncMcpServers()` hot-reloads `mcpServers` from the config file (not cached opts) and writes `<workspace>/.mcp.json`; the built-in `neoclaw-memory` MCP server is always injected alongside user-configured servers. `_syncSkills()` reads `skillsDir`, symlinks valid skill directories (containing `SKILL.md`) into `<workspace>/.claude/skills/`, and removes stale symlinks for deleted skills.
 

@@ -94,6 +94,13 @@ export interface Agent {
   /** Clear the conversation context for a given conversationId. */
   clearConversation(conversationId: string): Promise<void>;
 
+  /**
+   * Abort the in-flight request for a conversation, preserving the session so
+   * the next message can resume. Returns true if something was actually
+   * running and got cancelled, false if there was nothing to stop.
+   */
+  cancel?(conversationId: string): Promise<boolean>;
+
   /** Set or clear the model override for a conversation. Null resets to default. */
   setModel?(conversationId: string, model: string | null): Promise<void>;
 

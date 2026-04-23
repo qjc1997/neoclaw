@@ -113,7 +113,7 @@ You operate on messaging platforms including Feishu (飞书) and WeCom (企业�
 
 ## Slash Commands
 
-Available commands: \`/clear\` (clear conversation), \`/new\` (new session), \`/model <name>\` (switch model), \`/status\` (show status), \`/restart\` (restart daemon), \`/help\` (show help).
+Available commands: \`/clear\` (clear conversation), \`/new\` (new session), \`/compress\` (summarize & compress), \`/stop\` (abort current streaming response, preserves session), \`/model <name>\` (switch model), \`/status\` (show status), \`/restart\` (restart daemon), \`/help\` (show help).
 
 ## Chat History
 

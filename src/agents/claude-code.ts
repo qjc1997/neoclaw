@@ -192,6 +192,8 @@ class ClaudeProcess {
   private _mutex = new Mutex();
   private _reader: ReadableStreamDefaultReader<string> | null = null;
   private _buffer = '';
+  /** Cached terminate() promise so concurrent calls share one teardown. */
+  private _terminatePromise: Promise<void> | null = null;
 
   constructor(
     private readonly opts: {
@@ -312,6 +314,14 @@ class ClaudeProcess {
   }
 
   async terminate(): Promise<void> {
+    // Share one teardown across concurrent callers — two /stop commands racing
+    // used to both reach stdin.end() on the same (already closed) FileSink.
+    if (this._terminatePromise) return this._terminatePromise;
+    this._terminatePromise = this._doTerminate();
+    return this._terminatePromise;
+  }
+
+  private async _doTerminate(): Promise<void> {
     if (!this._proc) return;
 
     if (this._reader) {
@@ -591,6 +601,25 @@ export class ClaudeCodeAgent implements Agent {
     this._sessionIds.delete(conversationId);
     this._flushSessions();
     log.info(`Conversation cleared: "${conversationId}"`);
+  }
+
+  async cancel(conversationId: string): Promise<boolean> {
+    // Only an in-flight streaming response is a valid cancel target. An idle
+    // pooled subprocess waiting for the next message isn't "running" in the
+    // sense /stop intends — killing it would misleadingly say "Stopped" when
+    // nothing was happening, and force a cold start on the next message.
+    if (!this._active.has(conversationId)) return false;
+    const proc = this._pool.get(conversationId);
+    if (!proc) return false;
+    await proc.terminate();
+    this._pool.delete(conversationId);
+    this._lastUsed.delete(conversationId);
+    // _active cleanup is handled by stream()'s finally: terminate() closes the
+    // subprocess stdout → _readLine returns null → exchange() loop exits →
+    // stream()'s try/finally deletes from _active.
+    // Preserve _sessionIds so the next message resumes the same Claude session.
+    log.info(`Cancelled conversation: "${conversationId}"`);
+    return true;
   }
 
   async dispose(): Promise<void> {

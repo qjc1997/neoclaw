@@ -6,7 +6,7 @@
  * - Start/stop all gateways
  * - Serialize per-conversation message handling (prevent race conditions)
  * - Manage conversation sessions (stable session IDs for multi-turn context)
- * - Handle built-in slash commands (/clear, /status, /restart, /help)
+ * - Handle built-in slash commands (/clear, /status, /restart, /stop, /help)
  */
 
 import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -113,6 +113,21 @@ export class Dispatcher {
   ): Promise<void> => {
     const key = this._conversationKey(msg);
     log.info(`Handling message for conversation key: ${key}`);
+
+    // Fast-path: /stop must bypass the per-conversation mutex, otherwise it
+    // would queue up behind the very stream it's trying to abort.
+    const earlyCmd = this._tryParseCommand(msg.text);
+    if (earlyCmd?.name === 'stop') {
+      const agent = this._getAgent();
+      const aborted = agent.cancel ? await agent.cancel(key) : false;
+      const replyText = aborted
+        ? '⛔️ Stopped the current response. Next message will continue the conversation if possible.'
+        : 'Nothing to stop — no active response.';
+      await reply({ text: replyText });
+      this._appendHistory(key, 'user', msg.text);
+      this._appendHistory(key, 'neoclaw', replyText);
+      return;
+    }
 
     const queue = this._getQueue(key);
     await queue.acquire();
@@ -389,7 +404,7 @@ export class Dispatcher {
 
   // ── Built-in slash commands ──────────────────────────────
 
-  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model', 'compress']);
+  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model', 'compress', 'review', 'stop']);
 
   private _tryParseCommand(text: string): { name: string; args: string } | null {
     let trimmed = text.trim();
@@ -537,7 +552,10 @@ export class Dispatcher {
           '**Available Commands**',
           '- `/clear` or `/new` — Start a fresh conversation',
           '- `/compress` — Summarize and compress the current session',
+          '- `/stop` — Abort the current streaming response (preserves session; next message resumes)',
           '- `/model [name]` — Show or change the model for this conversation',
+          '- `/review` — Review code changes (workspace by default, or the target set via `/review target <path>`)',
+          '- `/review target` — Show / set / clear the review target directory',
           '- `/status` — Show current session and system info',
           '- `/restart` — Restart the NeoClaw daemon',
           '- `/help` — Show this help message',
