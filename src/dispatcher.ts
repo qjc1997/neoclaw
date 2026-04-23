@@ -9,7 +9,7 @@
  * - Handle built-in slash commands (/clear, /status, /restart, /help)
  */
 
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Agent, AgentStreamEvent, RunRequest, RunResponse } from './agents/types.js';
 import type {
@@ -19,19 +19,16 @@ import type {
   ReplyFn,
   StreamHandler,
 } from './gateway/types.js';
+import type { CodeReviewConfig } from './config.js';
+import { readReviewTarget, REVIEW_TARGET_FILE, runCodeReview, validateExternalTarget } from './hooks/code-review.js';
 import type { MemoryManager } from './memory/manager.js';
 import { SpeechProcessor } from './speech/index.js';
 import type { SpeechConfig } from './speech/index.js';
+import { buildContextWarning } from './utils/context.js';
 import { logger } from './utils/logger.js';
 import { Mutex } from './utils/mutex.js';
 
 const log = logger('dispatcher');
-
-/** Token threshold for context usage warning (140K tokens). */
-const CONTEXT_WARNING_THRESHOLD = 140_000;
-
-const CONTEXT_WARNING_MSG =
-  '\n\n---\n⚠️ **上下文使用量已超过 140K tokens，建议尽快使用 `/compress` 压缩会话，避免上下文溢出导致信息丢失。**';
 
 // ── Dispatcher ────────────────────────────────────────────────
 
@@ -44,10 +41,17 @@ export class Dispatcher {
   private _gateways: Gateway[] = [];
   /** Per-conversation serial queues to prevent concurrent handling. */
   private _queues = new Map<string, Mutex>();
+  /**
+   * Per-conversation serial queues for code reviews. Separate from `_queues`
+   * because auto-reviews run fire-and-forget outside the main handler lock;
+   * without this, concurrent reviews on the same workspace race on git index.
+   */
+  private _reviewQueues = new Map<string, Mutex>();
   private _workspacesDir: string | null = null;
   private _memoryManager: MemoryManager | null = null;
   private _onRestart: RestartCallback | null = null;
   private _speechProcessor: SpeechProcessor | null = null;
+  private _codeReviewConfig: CodeReviewConfig | null = null;
 
   // ── Registration ──────────────────────────────────────────
 
@@ -87,6 +91,17 @@ export class Dispatcher {
   setSpeechConfig(config: SpeechConfig): void {
     this._speechProcessor = new SpeechProcessor(config);
     log.info(`Speech processor configured: backend=${config.backend}`);
+  }
+
+  /**
+   * Configure code review. Makes `/review` available and — if `enabled` —
+   * auto-triggers a review after each non-command response.
+   */
+  setCodeReviewConfig(config: CodeReviewConfig): void {
+    this._codeReviewConfig = config;
+    log.info(
+      `Code review configured: enabled=${config.enabled} model=${config.model ?? 'haiku'}`
+    );
   }
 
   // ── Handler (passed to gateways) ──────────────────────────
@@ -147,16 +162,13 @@ export class Dispatcher {
           async function* tracked(): AsyncGenerator<AgentStreamEvent> {
             for await (let event of agentStream) {
               if (event.type === 'done') {
-                const inputTokens = event.response.inputTokens ?? 0;
-                if (inputTokens >= CONTEXT_WARNING_THRESHOLD) {
+                const warning = buildContextWarning(event.response.inputTokens, event.response.contextWindow, event.response.model);
+                if (warning) {
                   event = {
                     ...event,
-                    response: {
-                      ...event.response,
-                      text: event.response.text + CONTEXT_WARNING_MSG,
-                    },
+                    response: { ...event.response, text: event.response.text + warning },
                   };
-                  log.warn(`Context usage ${inputTokens} tokens exceeds threshold for "${key}"`);
+                  log.warn(`Context usage ${event.response.inputTokens} tokens exceeds threshold for "${key}"`);
                 }
                 responseText = event.response.text;
               }
@@ -167,8 +179,9 @@ export class Dispatcher {
         } else {
           // Non-streaming fallback
           const response = await agent.run(request);
-          if ((response.inputTokens ?? 0) >= CONTEXT_WARNING_THRESHOLD) {
-            response.text += CONTEXT_WARNING_MSG;
+          const warning = buildContextWarning(response.inputTokens, response.contextWindow, response.model);
+          if (warning) {
+            response.text += warning;
             log.warn(`Context usage ${response.inputTokens} tokens exceeds threshold for "${key}"`);
           }
           responseText = response.text;
@@ -179,10 +192,111 @@ export class Dispatcher {
       log.info(`Response text: "${responseText}"`);
       this._appendHistory(key, 'user', msg.text);
       this._appendHistory(key, 'neoclaw', responseText);
+
+      // Auto-trigger code review for non-command messages (fire-and-forget)
+      if (!command && this._codeReviewConfig?.enabled) {
+        this._triggerReview(key, msg.chatId, msg.gatewayKind).catch((err) =>
+          log.warn(`Auto code review failed: ${err}`)
+        );
+      }
     } finally {
       queue.release();
     }
   };
+
+  /** Run code review on the workspace and send result to the originating chat. */
+  private async _triggerReview(
+    conversationKey: string,
+    chatId: string,
+    gatewayKind: string
+  ): Promise<void> {
+    const cfg = this._codeReviewConfig;
+    if (!cfg) return;
+    const workspaceDir = this._workspaceDirFor(conversationKey);
+    if (!workspaceDir) {
+      log.warn('Cannot run code review: no workspace dir configured');
+      return;
+    }
+    const result = await this._runReviewSerial(conversationKey, workspaceDir, cfg);
+    if (!result) return; // no changes
+    const header = this._reviewHeader(result.filesChanged.length, result.targetDir, workspaceDir);
+    await this.sendTo(gatewayKind, chatId, { text: header + result.reviewText });
+  }
+
+  /** Format the header of a review message, noting the target when external. */
+  private _reviewHeader(fileCount: number, targetDir: string, workspaceDir: string): string {
+    const plural = fileCount === 1 ? '' : 's';
+    const targetNote = targetDir === workspaceDir ? '' : ` · target: \`${targetDir}\``;
+    return `**📝 Code Review** (${fileCount} file${plural} changed${targetNote})\n\n`;
+  }
+
+  /**
+   * Handle `/review target …` subcommands: show, set, or clear the external
+   * review target pointer stored at `<workspace>/.review-target`.
+   */
+  private _handleReviewTarget(workspaceDir: string, arg: string): RunResponse {
+    if (!existsSync(workspaceDir)) mkdirSync(workspaceDir, { recursive: true });
+    const targetFile = join(workspaceDir, REVIEW_TARGET_FILE);
+
+    if (!arg) {
+      const current = readReviewTarget(workspaceDir);
+      if (!current) {
+        return {
+          text:
+            '**Review target**: (default — reviews this workspace itself)\n\n' +
+            'Usage:\n' +
+            '- `/review target <absolute_path>` — point review at an external git repo\n' +
+            '- `/review target clear` — restore default',
+        };
+      }
+      return { text: `**Review target**: \`${current}\`` };
+    }
+
+    if (arg === 'clear') {
+      if (existsSync(targetFile)) unlinkSync(targetFile);
+      return { text: 'Review target cleared. Reviews will now scan this workspace itself.' };
+    }
+
+    try {
+      validateExternalTarget(arg);
+    } catch (err) {
+      return { text: err instanceof Error ? err.message : String(err) };
+    }
+    writeFileSync(
+      targetFile,
+      `# neoclaw review target — absolute path to a git repo\n${arg}\n`,
+      'utf-8'
+    );
+    return {
+      text: `Review target set to \`${arg}\`. Next \`/review\` (or auto-review) will scan uncommitted changes there via \`git diff HEAD\`.`,
+    };
+  }
+
+  /**
+   * Run `runCodeReview` under a per-conversation mutex so concurrent reviews
+   * on the same workspace don't race on the git index.
+   */
+  private async _runReviewSerial(
+    conversationKey: string,
+    workspaceDir: string,
+    cfg: CodeReviewConfig
+  ): Promise<Awaited<ReturnType<typeof runCodeReview>>> {
+    let mutex = this._reviewQueues.get(conversationKey);
+    if (!mutex) {
+      mutex = new Mutex();
+      this._reviewQueues.set(conversationKey, mutex);
+    }
+    await mutex.acquire();
+    try {
+      return await runCodeReview({
+        workspaceDir,
+        model: cfg.model ?? 'haiku',
+        timeoutSecs: cfg.timeoutSecs ?? 180,
+      });
+    } finally {
+      mutex.release();
+    }
+  }
 
   // ── Lifecycle ──────────────────────────────────────────────
 
@@ -212,6 +326,7 @@ export class Dispatcher {
     workspacesDir?: string;
     memoryManager?: MemoryManager;
     speechConfig?: SpeechConfig;
+    codeReviewConfig?: CodeReviewConfig;
   }): Promise<void> {
     for (const agent of this._agents.values()) {
       await agent.dispose().catch((e) => log.warn(`Agent dispose during reload: ${e}`));
@@ -222,6 +337,7 @@ export class Dispatcher {
     if (opts.workspacesDir) this._workspacesDir = opts.workspacesDir;
     if (opts.memoryManager) this._memoryManager = opts.memoryManager;
     if (opts.speechConfig) this.setSpeechConfig(opts.speechConfig);
+    this._codeReviewConfig = opts.codeReviewConfig ?? null;
     log.info('Dispatcher reloaded');
   }
 
@@ -244,6 +360,13 @@ export class Dispatcher {
     // Thread messages get an isolated session to avoid polluting the main chat context
     if (msg.threadRootId) return `${msg.chatId}_thread_${msg.threadRootId}`;
     return msg.chatId;
+  }
+
+  /** Resolve the filesystem workspace directory for a conversation key. */
+  private _workspaceDirFor(conversationKey: string): string | null {
+    if (!this._workspacesDir) return null;
+    const sanitized = conversationKey.replace(/:/g, '_');
+    return join(this._workspacesDir, sanitized);
   }
 
   private _getQueue(key: string): Mutex {
@@ -342,12 +465,14 @@ export class Dispatcher {
             text: [
               `Current model: **${current}**`,
               '',
-              'Available models:',
-              '- `sonnet` — Claude Sonnet 4.6 (fast, balanced)',
-              '- `opus` — Claude Opus 4.6 (most capable)',
-              '- `haiku` — Claude Haiku 4.5 (fastest, lightweight)',
+              'Aliases:',
+              '- `sonnet` — latest Claude Sonnet (fast, balanced)',
+              '- `opus` — latest Claude Opus 4.7 (most capable)',
+              '- `haiku` — latest Claude Haiku (fastest, lightweight)',
               '',
-              'Usage: `/model <name>` to change, `/model reset` to use default.',
+              'You can also pass a full model ID, e.g. `claude-opus-4-7` or `claude-sonnet-4-6`.',
+              '',
+              'Usage: `/model <name|id>` to change, `/model reset` to use default.',
             ].join('\n'),
           };
         }
@@ -355,10 +480,9 @@ export class Dispatcher {
           await agent.setModel(key, null);
           return { text: 'Model reset to default. Takes effect on next message.' };
         }
-        const VALID_MODELS = new Set(['sonnet', 'opus', 'haiku']);
-        if (!VALID_MODELS.has(args)) {
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(args)) {
           return {
-            text: `Unknown model **${args}**. Available: ${[...VALID_MODELS].map((m) => `\`${m}\``).join(', ')}.`,
+            text: `Invalid model **${args}**. Use an alias (\`sonnet\`, \`opus\`, \`haiku\`) or a full model ID like \`claude-opus-4-7\`.`,
           };
         }
         await agent.setModel(key, args);
@@ -381,6 +505,31 @@ export class Dispatcher {
         const compressAgent = this._getAgent();
         await compressAgent.clearConversation(key);
         return { text: `${summaryNote}Context compressed and cleared, ready for a new conversation.` };
+      }
+
+      case 'review': {
+        if (!this._codeReviewConfig) {
+          return { text: 'Code review is not configured. Set `codeReview` in config.json to enable.' };
+        }
+        const workspaceDir = this._workspaceDirFor(key);
+        if (!workspaceDir) {
+          return { text: 'Code review unavailable: no workspace directory configured.' };
+        }
+        // `/review target …` — manage the external review target pointer
+        if (args.startsWith('target')) {
+          return this._handleReviewTarget(workspaceDir, args.slice('target'.length).trim());
+        }
+        try {
+          const result = await this._runReviewSerial(key, workspaceDir, this._codeReviewConfig);
+          if (!result) {
+            return { text: 'No code changes since last review.' };
+          }
+          const header = this._reviewHeader(result.filesChanged.length, result.targetDir, workspaceDir);
+          return { text: header + result.reviewText };
+        } catch (err) {
+          log.error(`/review failed: ${err}`);
+          return { text: `Code review failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
       }
 
       case 'help': {

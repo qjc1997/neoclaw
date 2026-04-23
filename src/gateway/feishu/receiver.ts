@@ -327,7 +327,7 @@ export type ParsedMessage = {
 export async function parseMessage(
   event: RawMessageEvent,
   creds: BotCredentials,
-  opts: { botOpenId?: string; groupAutoReply?: string[] } = {}
+  opts: { botOpenId?: string; groupAutoReply?: string[]; owners?: string[] } = {}
 ): Promise<ParsedMessage | null> {
   const msgId = event.message.message_id;
   if (!markSeen(msgId)) return null;
@@ -338,9 +338,10 @@ export async function parseMessage(
   const senderOpenId = event.sender.sender_id.open_id ?? '';
   const mentionedBot = isBotMentioned(event, opts.botOpenId);
   const isAutoReplyGroup = opts.groupAutoReply?.includes(chatId) ?? false;
+  const isOwner = opts.owners?.includes(senderOpenId) ?? false;
 
   log.info(
-    `Message ${msgId}: chatId=${chatId}, chatType=${chatType}, mentioned=${mentionedBot}, autoReply=${isAutoReplyGroup}`
+    `Message ${msgId}: chatId=${chatId}, chatType=${chatType}, mentioned=${mentionedBot}, autoReply=${isAutoReplyGroup}, isOwner=${isOwner}`
   );
 
   // In group chats, only respond when @mentioned or in an auto-reply group
@@ -406,7 +407,8 @@ export async function parseMessage(
   // Build the final text for the agent
   let text = rawText;
   if (quotedText && !isAutoReplyGroup) text = `[Replying to: "${quotedText}"]\n\n${text}`;
-  if (chatType === 'group' && !isAutoReplyGroup) text = `${senderOpenId}: ${text}`;
+  // Owners get no prefix anywhere — that's how the agent recognizes them as the bot owner.
+  if (chatType === 'group' && !isAutoReplyGroup && !isOwner) text = `${senderOpenId}: ${text}`;
   log.info(`Message ${msgId}: text=${text}`);
 
   return {

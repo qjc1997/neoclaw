@@ -133,7 +133,16 @@ type ResultEvent = {
   model: string;
   is_error: boolean;
   duration_ms: number | null;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+  modelUsage?: Record<
+    string,
+    { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }
+  >;
   permission_denials?: PermissionDenial[];
 };
 
@@ -213,7 +222,17 @@ class ClaudeProcess {
       '--verbose',
     ];
     if (this.opts.resumeSessionId) args.push('--resume', this.opts.resumeSessionId);
-    if (this.opts.model) args.push('--model', this.opts.model);
+    if (this.opts.model) {
+      // Auto-enable 1M context for supported models unless user explicitly specified a bracket suffix
+      let model = this.opts.model;
+      if (!model.includes('[')) {
+        const base = model.replace(/-\d{8}$/, ''); // strip date suffix
+        if (['opus', 'sonnet', 'claude-opus-4-7', 'claude-opus-4-6', 'claude-sonnet-4-6'].includes(base)) {
+          model = `${model}[1m]`;
+        }
+      }
+      args.push('--model', model);
+    }
     if (this.opts.allowedTools && this.opts.allowedTools.length > 0) {
       args.push('--allowedTools', this.opts.allowedTools.join(','));
     } else {
@@ -505,6 +524,21 @@ export class ClaudeCodeAgent implements Agent {
 
     log.info(`Run done: ${JSON.stringify({ text, thinking, resultEvt })}`);
 
+    // Compute total input tokens (includes cache hits)
+    const usage = resultEvt?.usage;
+    const totalInputTokens =
+      usage
+        ? (usage.input_tokens ?? 0) +
+          (usage.cache_creation_input_tokens ?? 0) +
+          (usage.cache_read_input_tokens ?? 0)
+        : null;
+
+    // Extract contextWindow from modelUsage (first model entry)
+    const modelUsage = resultEvt?.modelUsage;
+    const contextWindow = modelUsage
+      ? Object.values(modelUsage)[0]?.contextWindow ?? null
+      : null;
+
     yield {
       type: 'done',
       response: {
@@ -512,10 +546,11 @@ export class ClaudeCodeAgent implements Agent {
         thinking,
         sessionId: resultEvt?.session_id ?? null,
         costUsd: resultEvt?.cost_usd ?? null,
-        inputTokens: resultEvt?.usage?.input_tokens ?? null,
-        outputTokens: resultEvt?.usage?.output_tokens ?? null,
+        inputTokens: totalInputTokens,
+        outputTokens: usage?.output_tokens ?? null,
         elapsedMs: Date.now() - t0,
         model: resultEvt?.model ?? null,
+        contextWindow,
       },
     };
   }

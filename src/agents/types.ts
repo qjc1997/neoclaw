@@ -46,6 +46,8 @@ export interface RunResponse {
   outputTokens?: number | null;
   elapsedMs?: number | null;
   model?: string | null;
+  /** Model context window size reported by the backend (tokens). */
+  contextWindow?: number | null;
 }
 
 // ── Streaming event types ─────────────────────────────────────

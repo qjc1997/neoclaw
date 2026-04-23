@@ -7,7 +7,7 @@
  * Protocol-level concerns handled here:
  * - WebSocket lifecycle
  * - Message deduplication
- * - Reaction emoji (⏳ while processing, removed when done)
+ * - Reaction emoji (⏳ while processing, replaced with ✅ on success or 😭 on failure)
  * - Reply-to-message threading
  * - Error reporting back to the user
  * - Streaming card updates via Feishu cardkit API (JSON 2.0)
@@ -16,6 +16,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import type { AgentStreamEvent, RunResponse } from '../../agents/types.js';
 import type { FeishuConfig } from '../../config.js';
+import { contextUsagePercent } from '../../utils/context.js';
 import { logger } from '../../utils/logger.js';
 import type { Gateway, InboundMessage, MessageHandler, ReplyFn, StreamHandler } from '../types.js';
 import type { BotCredentials, RawMessageEvent } from './client.js';
@@ -196,6 +197,7 @@ export class FeishuGateway implements Gateway {
     const parsed = await parseMessage(event, creds, {
       botOpenId,
       groupAutoReply: this._config.groupAutoReply,
+      owners: this._config.owners,
     });
     log.debug(`Parsed message: ${JSON.stringify(parsed, null, 2)}`);
     if (!parsed) return;
@@ -229,8 +231,10 @@ export class FeishuGateway implements Gateway {
       this._streamingReply(parsed.chatId, stream, parsed.messageId);
 
     const reactionId = await addReaction(client, parsed.messageId, 'OneSecond');
+    let succeeded = false;
     try {
       await this._handler(msg, reply, streamHandler);
+      succeeded = true;
     } catch (err) {
       log.error(`Failed to process message ${parsed.messageId}: ${err}`);
       try {
@@ -242,6 +246,7 @@ export class FeishuGateway implements Gateway {
       }
     } finally {
       if (reactionId) await removeReaction(client, parsed.messageId, reactionId);
+      await addReaction(client, parsed.messageId, succeeded ? 'DONE' : 'CRY');
     }
   }
 
@@ -544,5 +549,7 @@ function formatStats(response: RunResponse): string | null {
   if (response.inputTokens != null) parts.push(`${response.inputTokens} in`);
   if (response.outputTokens != null) parts.push(`${response.outputTokens} out`);
   if (response.costUsd != null) parts.push(`$${response.costUsd.toFixed(4)}`);
+  const ctxPct = contextUsagePercent(response.inputTokens, response.contextWindow, response.model);
+  if (ctxPct != null) parts.push(`ctx ${ctxPct}%`);
   return parts.length > 0 ? parts.join(' · ') : null;
 }

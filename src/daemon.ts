@@ -289,6 +289,9 @@ export class NeoClawDaemon {
     if (this.config.speech) {
       dispatcher.setSpeechConfig(this.config.speech);
     }
+    if (this.config.codeReview) {
+      dispatcher.setCodeReviewConfig(this.config.codeReview);
+    }
 
     // Register Feishu gateway if credentials are present
     if (this.config.feishu.appId && this.config.feishu.appSecret) {
@@ -387,6 +390,7 @@ export class NeoClawDaemon {
       workspacesDir: newConfig.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
       memoryManager,
       speechConfig: newConfig.speech,
+      codeReviewConfig: newConfig.codeReview,
     });
 
     // 7. Start new periodic reindex

@@ -11,6 +11,7 @@
  */
 
 import type { AgentStreamEvent, RunResponse } from '../../agents/types.js';
+import { contextUsagePercent } from '../../utils/context.js';
 import { logger } from '../../utils/logger.js';
 import type { Gateway, InboundMessage, MessageHandler, ReplyFn, StreamHandler } from '../types.js';
 import { WeworkWsClient, type InboundMessage as WsInboundMessage, type MessageCallback } from './ws-client.js';
@@ -26,6 +27,8 @@ function formatStats(response: RunResponse): string | null {
   if (response.inputTokens != null) parts.push(`${response.inputTokens} in`);
   if (response.outputTokens != null) parts.push(`${response.outputTokens} out`);
   if (response.costUsd != null) parts.push(`$${response.costUsd.toFixed(4)}`);
+  const ctxPct = contextUsagePercent(response.inputTokens, response.contextWindow, response.model);
+  if (ctxPct != null) parts.push(`ctx ${ctxPct}%`);
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
