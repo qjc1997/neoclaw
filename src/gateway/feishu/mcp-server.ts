@@ -15,6 +15,9 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 // ── Config from environment ──────────────────────────────────
 
@@ -22,6 +25,43 @@ const appId = process.env['FEISHU_APP_ID'] ?? '';
 const appSecret = process.env['FEISHU_APP_SECRET'] ?? '';
 const domain = process.env['FEISHU_DOMAIN'] ?? 'feishu';
 const currentChatId = process.env['NEOCLAW_CHAT_ID'] ?? '';
+
+/**
+ * Resolve the @mention target for the current message.
+ *
+ * Priority:
+ * 1. `.neoclaw/current_author` file in the workspace — written by the
+ *    dispatcher on every inbound message, so it always reflects the
+ *    real-time sender.
+ * 2. NEOCLAW_AUTHOR_ID env var — set once at process spawn (may be stale).
+ * 3. feishu.owners[0] from config — fallback for cron / proactive messages.
+ */
+function resolveAuthorId(): string {
+  // Try the per-workspace live file first
+  const workspacesDir = process.env['NEOCLAW_WORKSPACES_DIR'] ?? join(homedir(), '.neoclaw', 'workspaces');
+  const chatId = currentChatId; // e.g. oc_abc123
+  if (chatId) {
+    const sanitized = chatId.replace(/:/g, '_');
+    const authorFile = join(workspacesDir, sanitized, '.neoclaw', 'current_author');
+    try {
+      if (existsSync(authorFile)) {
+        const id = readFileSync(authorFile, 'utf-8').trim();
+        if (id) return id;
+      }
+    } catch { /* ignore */ }
+  }
+  // Env var fallback
+  if (process.env['NEOCLAW_AUTHOR_ID']) return process.env['NEOCLAW_AUTHOR_ID'];
+  // Config owners fallback
+  try {
+    const configPath = process.env['NEOCLAW_CONFIG'] ?? join(homedir(), '.neoclaw', 'config.json');
+    if (existsSync(configPath)) {
+      const cfg = JSON.parse(readFileSync(configPath, 'utf-8')) as { feishu?: { owners?: string[] } };
+      return cfg.feishu?.owners?.[0] ?? '';
+    }
+  } catch { /* ignore */ }
+  return '';
+}
 
 function larkDomain(d: string): Lark.Domain | string {
   if (d === 'lark') return Lark.Domain.Lark;
@@ -187,6 +227,51 @@ async function fetchHistory(opts: {
   });
 
   return { messages: formatted, hasMore: allItems.length >= opts.count };
+}
+
+// ── Send text message ────────────────────────────────────────
+
+async function sendTextMessage(opts: {
+  receiveId: string;
+  text: string;
+  mentionUserId?: string;
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  if (!appId || !appSecret) {
+    return { success: false, error: 'Feishu credentials not configured' };
+  }
+  try {
+    const token = await getTenantAccessToken();
+    const idType = receiveIdType(opts.receiveId);
+
+    // @mention: use explicitly provided ID first, fall back to env-injected author ID
+    const isGroupChat = idType === 'chat_id';
+    // Resolve dynamically so it always reflects the latest message sender
+    const mentionId = opts.mentionUserId || (isGroupChat ? resolveAuthorId() : '');
+    const textWithMention = mentionId
+      ? `<at user_id="${mentionId}"></at> ${opts.text}`
+      : opts.text;
+
+    const res = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${idType}`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          receive_id: opts.receiveId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: textWithMention }),
+        }),
+      }
+    );
+    const json = await res.json() as { code: number; msg?: string; data?: { message_id?: string } };
+    return {
+      success: json.code === 0,
+      messageId: json.data?.message_id,
+      error: json.code !== 0 ? `${json.code}: ${json.msg ?? ''}` : undefined,
+    };
+  } catch (err) {
+    return { success: false, error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 // ── File upload & send ────────────────────────────────────────
@@ -455,6 +540,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'feishu_send_message',
+      description:
+        'Send a text message to a Feishu chat or user. When sending to a group chat (receive_id starts with "oc_"), always pass mention_user_id so the recipient gets @mentioned. In group chats, each user message starts with their open_id as a prefix (e.g. "ou_xxx: message") — extract that open_id and pass it as mention_user_id.',
+      inputSchema: {
+        type: 'object' as const,
+        required: ['text'],
+        properties: {
+          text: {
+            type: 'string',
+            description: 'The text content to send.',
+          },
+          receive_id: {
+            type: 'string',
+            description:
+              'Feishu chat ID ("oc_...") or user open_id ("ou_..."). If omitted, sends to the current chat.',
+          },
+          mention_user_id: {
+            type: 'string',
+            description:
+              'open_id of the user to @mention (starts with "ou_"). Required when sending to a group chat — extract it from the "ou_xxx:" prefix of the current user\'s message. Ignored for private chats.',
+          },
+        },
+      },
+    },
+    {
       name: 'feishu_get_history',
       description:
         'Fetch recent chat history messages from a Feishu group or direct chat. Returns messages in chronological order with timestamp, sender ID, and text content. Useful for catching up on conversation context.',
@@ -488,6 +598,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === 'feishu_send_message') {
+    const text = args?.['text'] as string;
+    if (!text) {
+      return { content: [{ type: 'text', text: 'Error: text is required.' }] };
+    }
+    const receiveId = (args?.['receive_id'] as string) || currentChatId;
+    if (!receiveId) {
+      return { content: [{ type: 'text', text: 'Error: No receive_id provided and NEOCLAW_CHAT_ID is not set.' }] };
+    }
+    const mentionUserId = args?.['mention_user_id'] as string | undefined;
+    const result = await sendTextMessage({ receiveId, text, mentionUserId });
+    if (!result.success) {
+      return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    }
+    return { content: [{ type: 'text', text: `Message sent successfully. Message ID: ${result.messageId ?? 'unknown'}` }] };
+  }
 
   if (name === 'feishu_send_file') {
     const filePath = args?.['file_path'] as string;

@@ -25,10 +25,28 @@ import type { MemoryManager } from './memory/manager.js';
 import { SpeechProcessor } from './speech/index.js';
 import type { SpeechConfig } from './speech/index.js';
 import { buildContextWarning } from './utils/context.js';
+import { recordCost } from './utils/cost-tracker.js';
 import { logger } from './utils/logger.js';
 import { Mutex } from './utils/mutex.js';
 
 const log = logger('dispatcher');
+
+/**
+ * Tools that mutate files. Used to detect whether a streaming turn actually
+ * touched code — purely conversational/read-only turns are skipped by the
+ * auto code-review trigger to avoid noise.
+ */
+const FILE_MUTATING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** Extract the filesystem path from a file-mutating tool's input, if any. */
+function extractMutatedFile(name: string, input: unknown): string | null {
+  if (!FILE_MUTATING_TOOLS.has(name)) return null;
+  if (typeof input !== 'object' || input === null) return null;
+  const i = input as Record<string, unknown>;
+  // Edit / Write / MultiEdit use file_path; NotebookEdit uses notebook_path
+  const path = i['file_path'] ?? i['notebook_path'];
+  return typeof path === 'string' ? path : null;
+}
 
 // ── Dispatcher ────────────────────────────────────────────────
 
@@ -135,6 +153,17 @@ export class Dispatcher {
     try {
       let responseText = '';
 
+      // Files written by Edit/Write/MultiEdit/NotebookEdit during this turn —
+      // populated only on the streaming path (non-streaming has no tool_use signal).
+      // Used to skip auto code-review for purely conversational turns.
+      const mutatedFiles = new Set<string>();
+      // Whether the agent invoked Bash during this turn. Bash can mutate files
+      // (sed -i, mv, rm, > redirect, git mv, patch …) without leaving a Edit/Write
+      // trace — when set, we still trigger review and let `git diff` decide if
+      // anything actually changed. Pure read-only Bash (ls, cat, git status …)
+      // costs us a no-op review pass; that's cheaper than missing real changes.
+      let bashUsed = false;
+
       // Slash commands are always non-streaming
       const command = this._tryParseCommand(msg.text);
       if (command) {
@@ -169,6 +198,7 @@ export class Dispatcher {
           chatId: msg.chatId,
           gatewayKind: msg.gatewayKind,
           attachments: msg.attachments,
+          authorId: msg.authorId,
         };
 
         if (streamHandler && agent.stream) {
@@ -176,6 +206,11 @@ export class Dispatcher {
           const agentStream = agent.stream(request);
           async function* tracked(): AsyncGenerator<AgentStreamEvent> {
             for await (let event of agentStream) {
+              if (event.type === 'tool_use') {
+                if (event.name === 'Bash') bashUsed = true;
+                const mutated = extractMutatedFile(event.name, event.input);
+                if (mutated) mutatedFiles.add(mutated);
+              }
               if (event.type === 'done') {
                 const warning = buildContextWarning(event.response.inputTokens, event.response.contextWindow, event.response.model);
                 if (warning) {
@@ -186,6 +221,15 @@ export class Dispatcher {
                   log.warn(`Context usage ${event.response.inputTokens} tokens exceeds threshold for "${key}"`);
                 }
                 responseText = event.response.text;
+                recordCost({
+                  conversationId: key,
+                  gatewayKind: msg.gatewayKind,
+                  model: event.response.model ?? null,
+                  inputTokens: event.response.inputTokens ?? null,
+                  outputTokens: event.response.outputTokens ?? null,
+                  costUsd: event.response.costUsd ?? null,
+                  elapsedMs: event.response.elapsedMs ?? null,
+                });
               }
               yield event;
             }
@@ -200,6 +244,15 @@ export class Dispatcher {
             log.warn(`Context usage ${response.inputTokens} tokens exceeds threshold for "${key}"`);
           }
           responseText = response.text;
+          recordCost({
+            conversationId: key,
+            gatewayKind: msg.gatewayKind,
+            model: response.model ?? null,
+            inputTokens: response.inputTokens ?? null,
+            outputTokens: response.outputTokens ?? null,
+            costUsd: response.costUsd ?? null,
+            elapsedMs: response.elapsedMs ?? null,
+          });
           await reply(response);
         }
       }
@@ -207,10 +260,23 @@ export class Dispatcher {
       log.info(`Response text: "${responseText}"`);
       this._appendHistory(key, 'user', msg.text);
       this._appendHistory(key, 'neoclaw', responseText);
+      this._updateCurrentAuthor(key, msg.authorId);
 
-      // Auto-trigger code review for non-command messages (fire-and-forget)
-      if (!command && this._codeReviewConfig?.enabled) {
-        this._triggerReview(key, msg.chatId, msg.gatewayKind).catch((err) =>
+      // Auto-trigger code review when the agent either edited files via the
+      // file tools (Edit/Write/MultiEdit/NotebookEdit) or invoked Bash — Bash
+      // can mutate files without leaving an Edit trace. Pure-chat / pure-read
+      // turns (Read/Grep/Glob only) are skipped. `runCodeReview` then bails
+      // cheaply if `git diff` shows no actual change.
+      if (
+        !command &&
+        this._codeReviewConfig?.enabled &&
+        (mutatedFiles.size > 0 || bashUsed)
+      ) {
+        const fileList = mutatedFiles.size > 0 ? [...mutatedFiles] : undefined;
+        log.info(
+          `Auto-review triggered for "${key}" — ${fileList ? `${fileList.length} mutated file(s)` : 'Bash-only signal'}`
+        );
+        this._triggerReview(key, msg.chatId, msg.gatewayKind, fileList).catch((err) =>
           log.warn(`Auto code review failed: ${err}`)
         );
       }
@@ -223,7 +289,8 @@ export class Dispatcher {
   private async _triggerReview(
     conversationKey: string,
     chatId: string,
-    gatewayKind: string
+    gatewayKind: string,
+    mutatedFiles?: string[]
   ): Promise<void> {
     const cfg = this._codeReviewConfig;
     if (!cfg) return;
@@ -232,7 +299,7 @@ export class Dispatcher {
       log.warn('Cannot run code review: no workspace dir configured');
       return;
     }
-    const result = await this._runReviewSerial(conversationKey, workspaceDir, cfg);
+    const result = await this._runReviewSerial(conversationKey, workspaceDir, cfg, mutatedFiles);
     if (!result) return; // no changes
     const header = this._reviewHeader(result.filesChanged.length, result.targetDir, workspaceDir);
     await this.sendTo(gatewayKind, chatId, { text: header + result.reviewText });
@@ -294,7 +361,8 @@ export class Dispatcher {
   private async _runReviewSerial(
     conversationKey: string,
     workspaceDir: string,
-    cfg: CodeReviewConfig
+    cfg: CodeReviewConfig,
+    mutatedFiles?: string[]
   ): Promise<Awaited<ReturnType<typeof runCodeReview>>> {
     let mutex = this._reviewQueues.get(conversationKey);
     if (!mutex) {
@@ -307,6 +375,7 @@ export class Dispatcher {
         workspaceDir,
         model: cfg.model ?? 'haiku',
         timeoutSecs: cfg.timeoutSecs ?? 180,
+        mutatedFiles,
       });
     } finally {
       mutex.release();
@@ -580,6 +649,23 @@ export class Dispatcher {
       appendFileSync(join(historyDir, `${date}.txt`), `[${role}] ${text}\n\n`, 'utf-8');
     } catch (err) {
       log.warn(`Failed to write conversation history: ${err}`);
+    }
+  }
+
+  /**
+   * Persist the current message sender's ID to a file so the Feishu MCP server
+   * can read it at tool-call time for dynamic @mention.
+   */
+  private _updateCurrentAuthor(conversationKey: string, authorId: string | undefined): void {
+    log.info(`[author] conversationKey=${conversationKey} authorId="${authorId ?? '(empty)'}"`);
+    if (!this._workspacesDir || !authorId) return;
+    const sanitized = conversationKey.replace(/:/g, '_');
+    const metaDir = join(this._workspacesDir, sanitized, '.neoclaw');
+    try {
+      if (!existsSync(metaDir)) mkdirSync(metaDir, { recursive: true });
+      writeFileSync(join(metaDir, 'current_author'), authorId, 'utf-8');
+    } catch (err) {
+      log.warn(`Failed to write current author: ${err}`);
     }
   }
 }

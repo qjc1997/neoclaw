@@ -667,13 +667,13 @@ export class ClaudeCodeAgent implements Agent {
 
   // ── Internals ─────────────────────────────────────────────
 
-  private _conversationCwd(conversationId: string): string | null {
+  private _conversationCwd(conversationId: string, authorId?: string): string | null {
     if (!this.opts.cwd) return null;
     // Sanitize conversationId for use as a directory name (replace ':' with '_')
     const dirName = conversationId.replace(/:/g, '_');
     const cwd = join(this.opts.cwd, dirName);
     mkdirSync(cwd, { recursive: true });
-    this._prepareWorkspace(cwd);
+    this._prepareWorkspace(cwd, authorId);
     return cwd;
   }
 
@@ -682,15 +682,15 @@ export class ClaudeCodeAgent implements Agent {
    * - .mcp.json for MCP server definitions (hot-reloaded from config file)
    * - .claude/skills/<name> symlinks for skill directories (with stale cleanup)
    */
-  private _prepareWorkspace(cwd: string): void {
-    this._syncMcpServers(cwd);
+  private _prepareWorkspace(cwd: string, authorId?: string): void {
+    this._syncMcpServers(cwd, authorId);
     this._syncSkills(cwd);
   }
 
   /** Re-read mcpServers from config file on each process start so changes take effect without daemon restart. */
-  private _syncMcpServers(cwd: string): void {
+  private _syncMcpServers(cwd: string, authorId?: string): void {
     let mcpServers: Record<string, McpServerConfig> | undefined;
-    let feishuConfig: { appId: string; appSecret: string; domain?: string } | undefined;
+    let feishuConfig: { appId: string; appSecret: string; domain?: string; owners?: string[] } | undefined;
     try {
       const freshConfig = loadConfig();
       mcpServers = freshConfig.mcpServers;
@@ -699,8 +699,16 @@ export class ClaudeCodeAgent implements Agent {
       mcpServers = this.opts.mcpServers;
     }
 
-    // Inject built-in memory MCP server
+    // Inject built-in memory MCP servers: global + workspace-scoped
+    //
+    // Workspace memory points to Claude Code's native auto-memory directory for
+    // this conversation's cwd. Claude Code derives this path by replacing every
+    // non-alphanumeric character in the cwd with '-', so NeoClaw can compute the
+    // same path deterministically — no extra config required.
     const memoryDir = join(homedir(), '.neoclaw', 'memory');
+    const claudeProjectsDir = join(homedir(), '.claude', 'projects');
+    const sanitizedCwd = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+    const workspaceMemoryDir = join(claudeProjectsDir, sanitizedCwd, 'memory');
     const memoryMcpScript = join(import.meta.dir, '..', 'memory', 'mcp-server.ts');
     const allServers: Record<string, McpServerConfig> = {
       ...mcpServers,
@@ -708,13 +716,22 @@ export class ClaudeCodeAgent implements Agent {
         type: 'stdio',
         command: 'bun',
         args: ['run', memoryMcpScript],
-        env: { NEOCLAW_MEMORY_DIR: memoryDir },
+        env: { NEOCLAW_MEMORY_DIR: memoryDir, NEOCLAW_MEMORY_SCOPE: 'global' },
+      },
+      'neoclaw-workspace-memory': {
+        type: 'stdio',
+        command: 'bun',
+        args: ['run', memoryMcpScript],
+        env: { NEOCLAW_MEMORY_DIR: workspaceMemoryDir, NEOCLAW_MEMORY_SCOPE: 'workspace' },
       },
     };
 
     // Inject built-in Feishu history MCP server (only if Feishu credentials are configured)
     if (feishuConfig?.appId && feishuConfig?.appSecret) {
       const feishuMcpScript = join(import.meta.dir, '..', 'gateway', 'feishu', 'mcp-server.ts');
+      // Fallback to first owner open_id when no per-message authorId is available
+      const resolvedAuthorId = authorId || feishuConfig.owners?.[0] || '';
+      log.info(`[syncMcpServers] authorId="${authorId}" resolvedAuthorId="${resolvedAuthorId}"`);
       allServers['neoclaw-feishu'] = {
         type: 'stdio',
         command: 'bun',
@@ -723,6 +740,7 @@ export class ClaudeCodeAgent implements Agent {
           FEISHU_APP_ID: feishuConfig.appId,
           FEISHU_APP_SECRET: feishuConfig.appSecret,
           FEISHU_DOMAIN: feishuConfig.domain ?? 'feishu',
+          ...(resolvedAuthorId ? { NEOCLAW_AUTHOR_ID: resolvedAuthorId } : {}),
         },
       };
     }
@@ -815,10 +833,14 @@ export class ClaudeCodeAgent implements Agent {
       model: effectiveModel,
       allowedTools: this.opts.allowedTools,
       systemPrompt: this.opts.systemPrompt ?? null,
-      cwd: this._conversationCwd(conversationId),
+      cwd: this._conversationCwd(conversationId, request.authorId),
       resumeSessionId,
       // Inject routing context so CLI tools (e.g. neoclaw-cron) know the current chat
-      extraEnv: { NEOCLAW_CHAT_ID: chatId, NEOCLAW_GATEWAY_KIND: gatewayKind },
+      extraEnv: {
+        NEOCLAW_CHAT_ID: chatId,
+        NEOCLAW_GATEWAY_KIND: gatewayKind,
+        ...(request.authorId ? { NEOCLAW_AUTHOR_ID: request.authorId } : {}),
+      },
     });
     await proc.start();
     this._pool.set(conversationId, proc);

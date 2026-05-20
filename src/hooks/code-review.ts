@@ -21,6 +21,13 @@ export interface CodeReviewOptions {
   workspaceDir: string;
   model: string;
   timeoutSecs: number;
+  /**
+   * Files the agent reported as modified during the latest turn (captured from
+   * Edit/Write/MultiEdit/NotebookEdit tool_use events). Passed to the reviewer
+   * as a focus hint. May be a subset of the full git diff (e.g. omits Bash-driven
+   * mutations) — the reviewer is told to consult `git status` if needed.
+   */
+  mutatedFiles?: string[];
 }
 
 export interface CodeReviewResult {
@@ -84,32 +91,62 @@ async function ensureGitRepo(dir: string): Promise<void> {
   log.info(`Initialized git repo for code review at ${dir}`);
 }
 
-const REVIEW_PROMPT_PREFIX = `You are reviewing code changes made by an AI assistant inside a workspace. Focus on:
+function buildReviewPrompt(diff: string, mutatedFiles: string[] | undefined): string {
+  const focusList =
+    mutatedFiles && mutatedFiles.length > 0
+      ? mutatedFiles.map((f) => `- ${f}`).join('\n')
+      : '(not reported — discover via `git status` / `git diff HEAD --name-only`)';
+
+  return `You are an independent, **read-only** code reviewer for an AI assistant's recent edits.
+
+You are running in the directory containing the changes with Read, Grep, and Glob tools (no Edit/Write/Bash). Use them to:
+1. Read CLAUDE.md and/or README.md (if present) for project conventions and architecture
+2. Inspect the modules around the changed files: imports, callers, type definitions
+
+The full diff is provided below — you do not need shell access to fetch more context.
+
+Focus your review on:
 - Bugs and logic errors
-- Security issues (command injection, XSS, SQL injection, secrets leaked in code)
-- Unclear naming or overly complex code
+- Security issues (command injection, XSS, SQL injection, secrets in code)
+- Architectural inconsistency with existing code (e.g. duplicating an existing helper, breaking a layering convention)
+- Unclear naming, dead code, or unnecessary complexity
 - Missing edge-case handling at system boundaries
 
-Report findings concisely in Markdown. Use \`file:line\` references. If everything looks good, say "LGTM" and briefly describe what the changes do. Keep the response under 400 words.
+Files the agent reported as modified in this turn:
+${focusList}
+
+Report findings concisely in Markdown with \`file:line\` references. Group by severity (Blocker / Concern / Nit). If everything looks good, say "LGTM" and briefly describe what the changes do and how they fit the project. Keep the response under 600 words.
 
 Here is the diff:
 
 \`\`\`diff
-`;
+${diff}
+\`\`\``;
+}
 
-const REVIEW_PROMPT_SUFFIX = '\n```';
-
-async function spawnReviewer(prompt: string, model: string, timeoutSecs: number): Promise<string> {
+async function spawnReviewer(
+  prompt: string,
+  model: string,
+  timeoutSecs: number,
+  cwd: string
+): Promise<string> {
   const env = { ...process.env };
   delete env['CLAUDECODE'];
   delete env['CLAUDE_CODE_ENTRYPOINT'];
 
+  // Reviewer is strictly read-only. The full diff is already in the prompt;
+  // Read/Grep/Glob are sufficient to inspect surrounding code & project conventions.
+  // Explicitly NO Edit/Write/Bash — a hallucinated mutation must not be able to
+  // touch the user's workspace or external review target. This is the contract
+  // the file header promises ("no state mutation"); enforce at tool granularity,
+  // not via prompt politeness.
   const proc = Bun.spawn(
-    ['claude', '-p', prompt, '--model', model, '--dangerously-skip-permissions'],
+    ['claude', '-p', prompt, '--model', model, '--allowedTools', 'Read,Grep,Glob'],
     {
       stdout: 'pipe',
       stderr: 'pipe',
       env,
+      cwd,
     }
   );
 
@@ -146,7 +183,7 @@ async function spawnReviewer(prompt: string, model: string, timeoutSecs: number)
 export async function runCodeReview(
   opts: CodeReviewOptions
 ): Promise<CodeReviewResult | null> {
-  const { workspaceDir, model, timeoutSecs } = opts;
+  const { workspaceDir, model, timeoutSecs, mutatedFiles } = opts;
   if (!existsSync(workspaceDir)) {
     log.warn(`Workspace does not exist: ${workspaceDir}`);
     return null;
@@ -155,18 +192,28 @@ export async function runCodeReview(
   const externalTarget = readReviewTarget(workspaceDir);
   if (externalTarget) {
     validateExternalTarget(externalTarget);
-    return reviewExternalTarget(externalTarget, model, timeoutSecs);
+    return reviewExternalTarget(externalTarget, model, timeoutSecs, mutatedFiles);
   }
 
-  return reviewInternalWorkspace(workspaceDir, model, timeoutSecs);
+  return reviewInternalWorkspace(workspaceDir, model, timeoutSecs, mutatedFiles);
 }
 
 /** Review an external git repo using `git diff HEAD` — no state mutation. */
 async function reviewExternalTarget(
   targetDir: string,
   model: string,
-  timeoutSecs: number
+  timeoutSecs: number,
+  mutatedFiles?: string[]
 ): Promise<CodeReviewResult | null> {
+  // mutatedFiles paths come from the AI agent running in NeoClaw's workspace
+  // (a different directory). Only keep paths that resolve under targetDir;
+  // otherwise the focus list misleads the reviewer. Workspace-relative or
+  // workspace-absolute paths get dropped — better to omit hints than to lie.
+  const targetPrefix = targetDir.endsWith('/') ? targetDir : targetDir + '/';
+  const focusFiles = mutatedFiles?.filter(
+    (p) => isAbsolute(p) && (p === targetDir || p.startsWith(targetPrefix))
+  );
+  const focus = focusFiles && focusFiles.length > 0 ? focusFiles : undefined;
   // Tracked changes (modified + deleted) vs HEAD, including staged.
   const diff = await runGit(targetDir, ['diff', 'HEAD', '--']);
   const trackedChanged = (await runGit(targetDir, ['diff', 'HEAD', '--name-only', '--']))
@@ -197,8 +244,8 @@ async function reviewExternalTarget(
       '\n';
   }
 
-  const prompt = REVIEW_PROMPT_PREFIX + augmentedDiff + REVIEW_PROMPT_SUFFIX;
-  const reviewText = await spawnReviewer(prompt, model, timeoutSecs);
+  const prompt = buildReviewPrompt(augmentedDiff, focus);
+  const reviewText = await spawnReviewer(prompt, model, timeoutSecs, targetDir);
   return { reviewText, filesChanged: changedFiles, targetDir };
 }
 
@@ -206,7 +253,8 @@ async function reviewExternalTarget(
 async function reviewInternalWorkspace(
   workspaceDir: string,
   model: string,
-  timeoutSecs: number
+  timeoutSecs: number,
+  mutatedFiles?: string[]
 ): Promise<CodeReviewResult | null> {
   await ensureGitRepo(workspaceDir);
   await runGit(workspaceDir, ['add', '-A']);
@@ -222,14 +270,14 @@ async function reviewInternalWorkspace(
 
   log.info(`Reviewing ${changedFiles.length} changed file(s) in ${workspaceDir} with ${model}`);
 
-  const prompt = REVIEW_PROMPT_PREFIX + staged + REVIEW_PROMPT_SUFFIX;
+  const prompt = buildReviewPrompt(staged, mutatedFiles);
 
   // On reviewer failure (timeout, non-zero exit, etc.), roll back the staged
   // index so the next review starts from a clean baseline — otherwise the
   // failed changes pile up and pollute subsequent review diffs.
   let reviewText: string;
   try {
-    reviewText = await spawnReviewer(prompt, model, timeoutSecs);
+    reviewText = await spawnReviewer(prompt, model, timeoutSecs, workspaceDir);
     await runGit(workspaceDir, [
       'commit',
       '-q',

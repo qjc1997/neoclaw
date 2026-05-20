@@ -33,6 +33,8 @@ export interface RunRequest {
   gatewayKind: string;
   /** Binary attachments (images, files, etc.) from the originating message. */
   attachments?: Attachment[];
+  /** Author's platform user ID (open_id for Feishu). Used for @mention in group chats. */
+  authorId?: string;
   /** Opaque metadata passed through from the channel. */
   extra?: Record<string, unknown>;
 }

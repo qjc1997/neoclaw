@@ -5,7 +5,9 @@
  * Each Claude Code subprocess gets its own instance.
  *
  * Environment variables:
- * - NEOCLAW_MEMORY_DIR: path to the memory directory (default: ~/.neoclaw/memory)
+ * - NEOCLAW_MEMORY_DIR:   path to the memory directory (default: ~/.neoclaw/memory)
+ * - NEOCLAW_MEMORY_SCOPE: "global" | "workspace" — controls tool descriptions so Claude
+ *                         can clearly distinguish the two instances. Defaults to "global".
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -17,9 +19,16 @@ import { KNOWLEDGE_TOPICS, MemoryManager } from './manager.js';
 import { MemoryStore } from './store.js';
 
 const memoryDir = process.env['NEOCLAW_MEMORY_DIR'] ?? join(homedir(), '.neoclaw', 'memory');
+const isWorkspace = (process.env['NEOCLAW_MEMORY_SCOPE'] ?? 'global') === 'workspace';
+
 const store = new MemoryStore(join(memoryDir, 'index.sqlite'));
 const manager = new MemoryManager(memoryDir, store);
 manager.reindex();
+
+// Scope prefix used in descriptions to make the two MCP instances unambiguous.
+const scope = isWorkspace
+  ? 'THIS CONVERSATION\'s workspace (isolated, per-chat)'
+  : 'GLOBAL memory shared across all conversations';
 
 const server = new Server(
   { name: 'neoclaw-memory', version: '1.0.0' },
@@ -31,7 +40,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_read',
       description:
-        'Read the full content of a memory entry by id. Use memory_list to discover available ids.',
+        `[${scope}] Read the full content of a memory entry by id. Use memory_list to discover available ids.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -47,7 +56,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_search',
       description:
-        'Full-text search across all memories (identity, knowledge, episodes). Returns up to 5 matches ranked by relevance. Each result includes id, title, category, date, tags, and content.',
+        `[${scope}] Full-text search across all memories (identity, knowledge, episodes). Returns up to 5 matches ranked by relevance. Each result includes id, title, category, date, tags, and content.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -64,7 +73,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_save',
       description:
-        'Save or overwrite a memory entry. For identity: writes to SOUL.md (id is always "SOUL"). For knowledge: writes to knowledge/{id}.md. Episodes cannot be written manually.',
+        `[${scope}] Save or overwrite a memory entry. For identity: writes to SOUL.md (id is always "SOUL"). For knowledge: writes to knowledge/{id}.md. Episodes cannot be written manually.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -96,7 +105,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'memory_list',
       description:
-        'List all stored memory entries with their id, title, category, date, and tags. Use this to discover entry ids for memory_read.',
+        `[${scope}] List all stored memory entries with their id, title, category, date, and tags. Use this to discover entry ids for memory_read.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
