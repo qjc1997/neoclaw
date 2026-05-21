@@ -129,8 +129,16 @@ type ResultEvent = {
   type: 'result';
   result: string;
   session_id: string;
-  cost_usd: number | null;
-  model: string;
+  // Claude CLI emits `total_cost_usd` in stream-json result events. The
+  // older `cost_usd` field is accepted as a fallback for forward/backward
+  // compatibility across CLI versions.
+  total_cost_usd?: number | null;
+  cost_usd?: number | null;
+  // Current CLI does NOT emit a top-level `model` field on the result event
+  // (only on the init event). The model identity at the time of the result
+  // is available as a key under `modelUsage`. Kept optional here for older
+  // CLI versions that may have had it.
+  model?: string;
   is_error: boolean;
   duration_ms: number | null;
   usage?: {
@@ -572,11 +580,16 @@ export class ClaudeCodeAgent implements Agent {
         text,
         thinking,
         sessionId: resultEvt?.session_id ?? null,
-        costUsd: resultEvt?.cost_usd ?? null,
+        costUsd: resultEvt?.total_cost_usd ?? resultEvt?.cost_usd ?? null,
         inputTokens: totalInputTokens,
         outputTokens: usage?.output_tokens ?? null,
         elapsedMs: Date.now() - t0,
-        model: resultEvt?.model ?? null,
+        // model identity lives under modelUsage keys in current CLI; older
+        // CLI versions had a top-level `model` field, fall back to that.
+        model:
+          (resultEvt?.modelUsage ? Object.keys(resultEvt.modelUsage)[0] : undefined)
+          ?? resultEvt?.model
+          ?? null,
         contextWindow,
       },
     };
