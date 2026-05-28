@@ -375,7 +375,7 @@ export async function parseMessage(
   );
   log.info(`Message ${msgId}: attachments=${JSON.stringify(attachments)}`);
 
-  // Fetch quoted/parent message content
+  // Fetch quoted/parent message content (and attachments for file/media replies)
   let quotedText: string | undefined;
   const parentId = event.message.parent_id;
   if (parentId) {
@@ -397,7 +397,26 @@ export async function parseMessage(
       const item = items?.[0];
       if (item) {
         const rawContent = ((item['body'] as Record<string, unknown>)?.['content'] as string) ?? '';
-        quotedText = extractText(rawContent, item['msg_type'] as string);
+        const parentMsgType = item['msg_type'] as string;
+
+        // For file/media parent messages: download the attachment and surface it
+        // to the agent instead of passing raw JSON as quoted text.
+        const mediaTypes = ['file', 'audio', 'video', 'image', 'sticker'];
+        if (mediaTypes.includes(parentMsgType)) {
+          try {
+            const parentAttachments = await fetchAttachments(client, parentId, parentMsgType, rawContent);
+            if (parentAttachments.length > 0) {
+              attachments.push(...parentAttachments);
+              // Use file name as human-readable quoted text
+              const fileName = parentAttachments[0]?.fileName;
+              quotedText = fileName ? `[file: ${fileName}]` : `[${parentMsgType}]`;
+            }
+          } catch {
+            /* skip — attachment download failure is non-fatal */
+          }
+        } else {
+          quotedText = extractText(rawContent, parentMsgType);
+        }
       }
     } catch {
       /* skip */

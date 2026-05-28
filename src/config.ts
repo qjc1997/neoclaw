@@ -31,6 +31,18 @@ export interface AgentConfig {
   allowedTools?: string[];
   /** Max seconds to wait for an agent response before timing out. Default: 300. */
   timeoutSecs?: number;
+  /**
+   * Custom LLM backend URL. When set, overrides ANTHROPIC_BASE_URL so the claude CLI
+   * sends requests to a different endpoint (e.g. a local Ollama instance).
+   * Example: "http://localhost:11434" for Ollama (requires Ollama >= 0.14).
+   * The model field should be set to the backend's model name (e.g. "qwen3:4b").
+   */
+  backendUrl?: string;
+  /**
+   * API key for the custom backend. Defaults to "local" when backendUrl is set.
+   * For Ollama this can be any non-empty string.
+   */
+  backendKey?: string;
 }
 
 export interface FeishuConfig {

@@ -273,6 +273,8 @@ export class NeoClawDaemon {
       cwd: this.config.workspacesDir,
       mcpServers: this.config.mcpServers,
       skillsDir: this.config.skillsDir,
+      backendUrl: this.config.agent.backendUrl,
+      backendKey: this.config.agent.backendKey,
     });
 
     // Initialize memory system (used for session summarization and periodic reindex)

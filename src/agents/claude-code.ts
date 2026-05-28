@@ -442,6 +442,8 @@ export class ClaudeCodeAgent implements Agent {
       mcpServers?: Record<string, McpServerConfig>;
       skillsDir?: string | null;
       modelOverrides?: Record<string, string>;
+      backendUrl?: string | null;
+      backendKey?: string | null;
     } = {}
   ) {
     this._loadSessions();
@@ -853,6 +855,12 @@ export class ClaudeCodeAgent implements Agent {
         NEOCLAW_CHAT_ID: chatId,
         NEOCLAW_GATEWAY_KIND: gatewayKind,
         ...(request.authorId ? { NEOCLAW_AUTHOR_ID: request.authorId } : {}),
+        // Custom LLM backend (e.g. local Ollama). When set, redirects the claude CLI
+        // to a different API endpoint instead of api.anthropic.com.
+        ...(this.opts.backendUrl ? {
+          ANTHROPIC_BASE_URL: this.opts.backendUrl,
+          ANTHROPIC_API_KEY: this.opts.backendKey ?? 'local',
+        } : {}),
       },
     });
     await proc.start();

@@ -125,6 +125,73 @@ function extractRichText(content: string): string {
   }
 }
 
+// ── File download ─────────────────────────────────────────────
+
+/**
+ * Find the message_id of a message in the current chat that contains the given
+ * file_key, then download the file content and return it as a string.
+ *
+ * Feishu requires the message_id to download a resource — you can't download
+ * by file_key alone. This function does the lookup automatically.
+ */
+async function readFileFromChat(opts: {
+  fileKey: string;
+  chatId: string;
+  maxLookback?: number; // max messages to scan, default 50
+}): Promise<{ content: string; fileName?: string } | { error: string }> {
+  if (!appId || !appSecret) return { error: 'Feishu credentials not configured' };
+
+  try {
+    const token = await getTenantAccessToken();
+    const maxLookback = opts.maxLookback ?? 50;
+
+    // Step 1: scan recent messages to find the one containing this file_key
+    const listRes = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages?container_id_type=chat&container_id=${opts.chatId}&page_size=${maxLookback}&sort_type=ByCreateTimeDesc`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const listJson = await listRes.json() as {
+      code: number;
+      data?: { items?: Array<{ message_id: string; body: { content: string }; msg_type: string }> };
+    };
+    if (listJson.code !== 0) return { error: `Messages list failed: ${listJson.code}` };
+
+    let messageId: string | null = null;
+    let fileName: string | undefined;
+    for (const item of listJson.data?.items ?? []) {
+      try {
+        const body = JSON.parse(item.body.content) as Record<string, unknown>;
+        if (body['file_key'] === opts.fileKey) {
+          messageId = item.message_id;
+          fileName = body['file_name'] as string | undefined;
+          break;
+        }
+      } catch { /* not JSON or no file_key */ }
+    }
+    if (!messageId) return { error: `File key "${opts.fileKey}" not found in the last ${maxLookback} messages` };
+
+    // Step 2: download the resource
+    const dlRes = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${opts.fileKey}?type=file`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!dlRes.ok) return { error: `Download failed: HTTP ${dlRes.status}` };
+
+    const contentType = dlRes.headers.get('content-type') ?? '';
+    const isText = contentType.includes('text') ||
+      fileName?.match(/\.(sh|py|js|ts|txt|md|json|yaml|yml|toml|conf|cfg|env|csv|xml|html)$/i);
+
+    if (isText) {
+      return { content: await dlRes.text(), fileName };
+    }
+    // Binary: return base64
+    const buf = await dlRes.arrayBuffer();
+    return { content: Buffer.from(buf).toString('base64'), fileName };
+  } catch (err) {
+    return { error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 // ── ID helpers ───────────────────────────────────────────────
 
 function receiveIdType(id: string): 'chat_id' | 'open_id' | 'user_id' {
@@ -565,6 +632,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'feishu_read_file',
+      description:
+        'Read the content of a file sent in the current Feishu chat. Pass the file_key from the message (e.g. "file_v3_xxx..."). Automatically locates the message and downloads the file — text files are returned as-is, binaries as base64.',
+      inputSchema: {
+        type: 'object' as const,
+        required: ['file_key'],
+        properties: {
+          file_key: {
+            type: 'string',
+            description: 'The file_key from the Feishu file message (starts with "file_v3_").',
+          },
+          chat_id: {
+            type: 'string',
+            description: 'Chat ID to search in. Defaults to the current chat.',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_monitor_job',
+      description:
+        'Start a background monitor for a long-running job (script/process). Spawns a lightweight watcher that reads a log file and sends Feishu progress messages automatically — no Claude tokens consumed after launch. Use after starting a background process with Bash.',
+      inputSchema: {
+        type: 'object' as const,
+        required: ['log_file'],
+        properties: {
+          log_file: {
+            type: 'string',
+            description: 'Absolute path to the log file written by the background process.',
+          },
+          job_label: {
+            type: 'string',
+            description: 'Human-readable name for the job shown in progress messages (e.g. "F4 ablation run").',
+          },
+          done_pattern: {
+            type: 'string',
+            description: 'Regex pattern in the log that signals completion (default: "DONE|FINISHED|ERROR|Traceback|exit code").',
+          },
+          progress_pattern: {
+            type: 'string',
+            description: 'Regex pattern to extract progress info from the log (e.g. "\\\\d+/\\\\d+ trial"). When matched and changed, sends an intermediate update.',
+          },
+          interval_sec: {
+            type: 'number',
+            description: 'How often to check the log file in seconds (default: 120).',
+          },
+          max_hours: {
+            type: 'number',
+            description: 'Safety timeout in hours — monitor stops and notifies if job exceeds this (default: 12).',
+          },
+          receive_id: {
+            type: 'string',
+            description: 'Feishu chat ID ("oc_...") or user open_id ("ou_...") to send reports to. Defaults to the current chat.',
+          },
+        },
+      },
+    },
+    {
       name: 'feishu_get_history',
       description:
         'Fetch recent chat history messages from a Feishu group or direct chat. Returns messages in chronological order with timestamp, sender ID, and text content. Useful for catching up on conversation context.',
@@ -598,6 +723,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === 'feishu_read_file') {
+    const fileKey = args?.['file_key'] as string;
+    if (!fileKey) return { content: [{ type: 'text', text: 'Error: file_key is required.' }] };
+    const chatId = (args?.['chat_id'] as string) || currentChatId;
+    if (!chatId) return { content: [{ type: 'text', text: 'Error: No chat_id and NEOCLAW_CHAT_ID not set.' }] };
+
+    const result = await readFileFromChat({ fileKey, chatId });
+    if ('error' in result) return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    const header = result.fileName ? `# ${result.fileName}\n\n` : '';
+    return { content: [{ type: 'text', text: header + result.content }] };
+  }
+
+  if (name === 'feishu_monitor_job') {
+    const logFile = args?.['log_file'] as string;
+    if (!logFile) {
+      return { content: [{ type: 'text', text: 'Error: log_file is required.' }] };
+    }
+    const receiveId = (args?.['receive_id'] as string) || currentChatId;
+    if (!receiveId) {
+      return { content: [{ type: 'text', text: 'Error: No receive_id provided and NEOCLAW_CHAT_ID is not set.' }] };
+    }
+    if (!appId || !appSecret) {
+      return { content: [{ type: 'text', text: 'Error: Feishu credentials not configured.' }] };
+    }
+
+    const monitorScript = new URL('monitor-job.ts', import.meta.url).pathname;
+    const spawnArgs = [
+      'run', monitorScript,
+      '--log-file', logFile,
+      '--chat-id', receiveId,
+      '--app-id', appId,
+      '--app-secret', appSecret,
+      '--domain', domain,
+    ];
+    if (args?.['job_label'])      spawnArgs.push('--job-label',       String(args['job_label']));
+    if (args?.['done_pattern'])   spawnArgs.push('--done-pattern',    String(args['done_pattern']));
+    if (args?.['progress_pattern']) spawnArgs.push('--progress-pattern', String(args['progress_pattern']));
+    if (args?.['interval_sec'])   spawnArgs.push('--interval',        String(args['interval_sec']));
+    if (args?.['max_hours'])      spawnArgs.push('--max-hours',       String(args['max_hours']));
+
+    try {
+      const proc = Bun.spawn(['bun', ...spawnArgs], {
+        stdout: 'ignore',
+        stderr: 'ignore',
+        // detach so it outlives this MCP server process
+        env: { ...process.env },
+      });
+      const label = (args?.['job_label'] as string) || logFile;
+      return {
+        content: [{
+          type: 'text',
+          text: `Monitor started (PID ${proc.pid}) for "${label}". Progress reports will be sent to ${receiveId}. Log: ${logFile}`,
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Failed to start monitor: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+  }
 
   if (name === 'feishu_send_message') {
     const text = args?.['text'] as string;
