@@ -706,10 +706,12 @@ export class ClaudeCodeAgent implements Agent {
   private _syncMcpServers(cwd: string, authorId?: string): void {
     let mcpServers: Record<string, McpServerConfig> | undefined;
     let feishuConfig: { appId: string; appSecret: string; domain?: string; owners?: string[] } | undefined;
+    let claudeUsageConfig: { sessionKey?: string; orgId?: string } | undefined;
     try {
       const freshConfig = loadConfig();
       mcpServers = freshConfig.mcpServers;
       feishuConfig = freshConfig.feishu;
+      claudeUsageConfig = freshConfig.claudeUsage;
     } catch {
       mcpServers = this.opts.mcpServers;
     }
@@ -756,6 +758,10 @@ export class ClaudeCodeAgent implements Agent {
           FEISHU_APP_SECRET: feishuConfig.appSecret,
           FEISHU_DOMAIN: feishuConfig.domain ?? 'feishu',
           ...(resolvedAuthorId ? { NEOCLAW_AUTHOR_ID: resolvedAuthorId } : {}),
+          ...(claudeUsageConfig?.sessionKey ? {
+            CLAUDE_USAGE_SESSION_KEY: claudeUsageConfig.sessionKey,
+            CLAUDE_USAGE_ORG_ID: claudeUsageConfig.orgId ?? '',
+          } : {}),
         },
       };
     }

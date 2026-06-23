@@ -25,6 +25,8 @@ const appId = process.env['FEISHU_APP_ID'] ?? '';
 const appSecret = process.env['FEISHU_APP_SECRET'] ?? '';
 const domain = process.env['FEISHU_DOMAIN'] ?? 'feishu';
 const currentChatId = process.env['NEOCLAW_CHAT_ID'] ?? '';
+const claudeUsageSessionKey = process.env['CLAUDE_USAGE_SESSION_KEY'] ?? '';
+const claudeUsageOrgId = process.env['CLAUDE_USAGE_ORG_ID'] ?? 'b0d11fd8-e6ac-4329-a8d2-13f5d9887446';
 
 /**
  * Resolve the @mention target for the current message.
@@ -187,6 +189,49 @@ async function readFileFromChat(opts: {
     // Binary: return base64
     const buf = await dlRes.arrayBuffer();
     return { content: Buffer.from(buf).toString('base64'), fileName };
+  } catch (err) {
+    return { error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+// ── Contact directory ─────────────────────────────────────────
+
+async function listOrgUsers(opts: {
+  pageSize?: number;
+  pageToken?: string;
+}): Promise<{ users: Array<{ open_id: string; name: string; email?: string }>; hasMore: boolean; nextToken?: string } | { error: string }> {
+  if (!appId || !appSecret) return { error: 'Feishu credentials not configured' };
+  try {
+    const token = await getTenantAccessToken();
+    const params = new URLSearchParams({
+      user_id_type: 'open_id',
+      page_size: String(Math.min(opts.pageSize ?? 50, 50)),
+      fields: 'open_id,name,email',
+    });
+    if (opts.pageToken) params.set('page_token', opts.pageToken);
+
+    const res = await fetch(
+      `https://open.feishu.cn/open-apis/contact/v3/users?${params}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const json = await res.json() as {
+      code: number;
+      msg?: string;
+      data?: {
+        has_more: boolean;
+        page_token?: string;
+        items?: Array<{ open_id?: string; name?: string; email?: string }>;
+      };
+    };
+    if (json.code !== 0) return { error: `API error ${json.code}: ${json.msg ?? ''}` };
+
+    const users = (json.data?.items ?? []).map(u => ({
+      open_id: u.open_id ?? '',
+      name: u.name ?? '',
+      email: u.email,
+    })).filter(u => u.open_id);
+
+    return { users, hasMore: json.data?.has_more ?? false, nextToken: json.data?.page_token };
   } catch (err) {
     return { error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -632,6 +677,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'claude_usage',
+      description:
+        'Fetch Claude subscription usage percentage from claude.ai. Returns utilization for the 5-hour and 7-day windows, plus per-model breakdowns. Uses CLAUDE_USAGE_SESSION_KEY from config by default; pass session_key to override.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          session_key: {
+            type: 'string',
+            description: 'Override the sessionKey cookie from claude.ai (sk-ant-sid02-...). If omitted, uses the value from config.',
+          },
+          org_id: {
+            type: 'string',
+            description: 'Organization ID. Defaults to the bot owner\'s org.',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_list_users',
+      description:
+        'List users in the Feishu organization directory. Returns open_id, name, and email for each user. Requires contact:contact.base:readonly permission. Use open_id with feishu_send_message to send private messages.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          page_size: {
+            type: 'number',
+            description: 'Number of users to fetch per page (max 50, default 50).',
+          },
+          page_token: {
+            type: 'string',
+            description: 'Pagination token from a previous call to get the next page.',
+          },
+        },
+      },
+    },
+    {
       name: 'feishu_read_file',
       description:
         'Read the content of a file sent in the current Feishu chat. Pass the file_key from the message (e.g. "file_v3_xxx..."). Automatically locates the message and downloads the file — text files are returned as-is, binaries as base64.',
@@ -723,6 +804,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === 'claude_usage') {
+    const sessionKey = (args?.['session_key'] as string) || claudeUsageSessionKey;
+    if (!sessionKey) return { content: [{ type: 'text', text: 'Error: session_key not provided and CLAUDE_USAGE_SESSION_KEY not configured.' }] };
+    const orgId = (args?.['org_id'] as string) || claudeUsageOrgId;
+
+    try {
+      const scriptPath = join(import.meta.dir, '..', '..', '..', 'scripts', 'claude-usage.mjs');
+      const proc = Bun.spawn(
+        [process.execPath, scriptPath, sessionKey, orgId],
+        { stdout: 'pipe', stderr: 'pipe', env: { ...process.env } }
+      );
+      const [stdout, , exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      if (exitCode !== 0) return { content: [{ type: 'text', text: `Error fetching usage (exit ${exitCode})` }] };
+
+      const d = JSON.parse(stdout) as Record<string, unknown>;
+      const fiveHour = d['five_hour'] as { utilization: number; resets_at: string } | null;
+      const sevenDay = d['seven_day'] as { utilization: number; resets_at: string } | null;
+      const sonnet = d['seven_day_sonnet'] as { utilization: number } | null;
+
+      const fmt = (iso: string) => new Date(iso).toLocaleString('zh-CN', { timeZone: 'Europe/Berlin', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      const lines = ['**Claude 订阅用量**\n'];
+      if (fiveHour) lines.push(`5小时窗口：**${fiveHour.utilization}%** (重置 ${fmt(fiveHour.resets_at)})`);
+      if (sevenDay) lines.push(`7天窗口：**${sevenDay.utilization}%** (重置 ${fmt(sevenDay.resets_at)})`);
+      if (sonnet) lines.push(`7天 Sonnet：${sonnet.utilization}%`);
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+  }
+
+  if (name === 'feishu_list_users') {
+    const result = await listOrgUsers({
+      pageSize: args?.['page_size'] as number | undefined,
+      pageToken: args?.['page_token'] as string | undefined,
+    });
+    if ('error' in result) return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    const lines = result.users.map(u => `${u.name || '(unnamed)'} | open_id: ${u.open_id}${u.email ? ` | ${u.email}` : ''}`);
+    const footer = result.hasMore ? `\n\n(More users available — pass page_token: "${result.nextToken}" to get next page)` : '';
+    return { content: [{ type: 'text', text: `${result.users.length} users:\n\n${lines.join('\n')}${footer}` }] };
+  }
 
   if (name === 'feishu_read_file') {
     const fileKey = args?.['file_key'] as string;

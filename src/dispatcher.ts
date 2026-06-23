@@ -53,6 +53,12 @@ function extractMutatedFile(name: string, input: unknown): string | null {
 /** Callback invoked when the /restart command is received. */
 export type RestartCallback = (info: { chatId: string; gatewayKind: string }) => void;
 
+type PendingMessage = {
+  msg: InboundMessage;
+  reply: ReplyFn;
+  streamHandler?: StreamHandler;
+};
+
 export class Dispatcher {
   private _agents = new Map<string, Agent>();
   private _defaultAgentKind = 'claude_code';
@@ -65,6 +71,13 @@ export class Dispatcher {
    * without this, concurrent reviews on the same workspace race on git index.
    */
   private _reviewQueues = new Map<string, Mutex>();
+  /**
+   * Messages that arrived while a turn was already in-flight for that
+   * conversation. Drained (in arrival order) by the in-flight turn before it
+   * releases the queue mutex, so each gets its own response without any gap
+   * where an unrelated message could slip in between.
+   */
+  private _pendingMessages = new Map<string, PendingMessage[]>();
   private _workspacesDir: string | null = null;
   private _memoryManager: MemoryManager | null = null;
   private _onRestart: RestartCallback | null = null;
@@ -148,9 +161,47 @@ export class Dispatcher {
     }
 
     const queue = this._getQueue(key);
-    await queue.acquire();
+
+    // Non-blocking check: if a turn is already in-flight for this conversation,
+    // push to the pending queue and return immediately. The in-flight turn will
+    // drain pending messages (in order) before releasing the mutex, ensuring
+    // each gets its own response without any gap between them.
+    if (!queue.tryAcquire()) {
+      const pending = this._pendingMessages.get(key) ?? [];
+      pending.push({ msg, reply, streamHandler });
+      this._pendingMessages.set(key, pending);
+      log.info(`Message queued (${pending.length} pending) for "${key}"`);
+      return;
+    }
 
     try {
+      await this._processTurn(msg, reply, streamHandler, key);
+
+      // Drain any messages that piled up while this turn was in-flight.
+      // Process them sequentially here, still holding the mutex, so no
+      // unrelated message can interleave between them. Each gets its own
+      // response sent via its own reply/streamHandler.
+      let next: PendingMessage | undefined;
+      while ((next = this._shiftPending(key))) {
+        log.info(`Draining pending message for "${key}"`);
+        await this._processTurn(next.msg, next.reply, next.streamHandler, key);
+      }
+    } finally {
+      queue.release();
+    }
+  };
+
+  /**
+   * Process a single message turn (no mutex — caller must hold the queue).
+   * Extracted so that `handle()` can call it for both the initial message
+   * and any pending messages drained after the initial turn completes.
+   */
+  private async _processTurn(
+    msg: InboundMessage,
+    reply: ReplyFn,
+    streamHandler: StreamHandler | undefined,
+    key: string
+  ): Promise<void> {
       let responseText = '';
 
       // Files written by Edit/Write/MultiEdit/NotebookEdit during this turn —
@@ -280,10 +331,16 @@ export class Dispatcher {
           log.warn(`Auto code review failed: ${err}`)
         );
       }
-    } finally {
-      queue.release();
-    }
-  };
+  }
+
+  /** Remove and return the next pending message for a conversation, or undefined. */
+  private _shiftPending(key: string): PendingMessage | undefined {
+    const queue = this._pendingMessages.get(key);
+    if (!queue?.length) return undefined;
+    const item = queue.shift();
+    if (queue.length === 0) this._pendingMessages.delete(key);
+    return item;
+  }
 
   /** Run code review on the workspace and send result to the originating chat. */
   private async _triggerReview(

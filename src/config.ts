@@ -104,6 +104,11 @@ export interface NeoClawConfig {
   speech?: import('./speech/types.js').SpeechConfig;
   /** Automatic code review configuration (optional). Runs `claude -p` on the workspace diff after each response. */
   codeReview?: CodeReviewConfig;
+  /** Claude.ai subscription usage tracking. sessionKey is the sessionKey cookie from claude.ai. */
+  claudeUsage?: {
+    sessionKey: string;
+    orgId?: string;
+  };
   /** Directory for agent workspaces. Default: ~/.neoclaw/workspaces. */
   workspacesDir?: string;
   /** Directory containing skill subdirectories. Default: ~/.neoclaw/skills. */

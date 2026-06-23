@@ -165,20 +165,6 @@ export class FeishuGateway implements Gateway {
       'im.chat.member.bot.deleted_v1': async (data) => {
         log.info(`Bot removed from chat: ${(data as Record<string, unknown>)['chat_id']}`);
       },
-      // Handle interactive card form submissions (AskUserQuestion answers).
-      // Must return a response within 3 seconds — process the message asynchronously.
-      'card.action.trigger': async (data: unknown) => {
-        if (this._stopped) return;
-        const evt = data as CardActionEvent;
-        const value = evt.action?.value;
-        if (value?.['_neoclaw_action'] !== 'questions_submit') return;
-
-        // Fire-and-forget: handler sends the agent message asynchronously
-        this._handleCardAction(evt).catch((err) => log.error(`Card action handler error: ${err}`));
-
-        // Return a toast immediately so the Feishu client doesn't show an error
-        return { toast: { type: 'success', content: 'Submitted, in progress...' } };
-      },
     } as Parameters<typeof dispatcher.register>[0]);
 
     this._wsClient = getWsClient(creds);
@@ -350,10 +336,11 @@ export class FeishuGateway implements Gateway {
     let lastThinkingFlush = 0;
     let lastMainFlush = 0;
     const FLUSH_INTERVAL_MS = 150;
-    // Pending question form: appended AFTER streaming mode is closed so the
-    // user can only interact once the card exits streaming mode (Feishu rejects
-    // card.action.trigger callbacks while streaming_mode is true → error 200340).
-    let pendingFormEls: Record<string, unknown>[] | null = null;
+    // Pending questions: sent as a plain-text message after streaming closes.
+    // The card form approach was abandoned because Feishu's WS SDK does not route
+    // card.action.trigger events through the EventDispatcher (they require an HTTP
+    // callback endpoint). Text-based Q&A works over the existing message channel.
+    let pendingQuestionsText: string | null = null;
 
     // Create and send the card on first use — idempotent after that.
     const ensureCard = async (): Promise<string> => {
@@ -451,17 +438,24 @@ export class FeishuGateway implements Gateway {
             lastMainFlush = now;
           }
         } else if (event.type === 'ask_questions') {
-          await ensureCard();
-          const { threadRootId } = parseConvId(event.conversationId);
-          // Defer form append until after closeCardStreaming — Feishu returns
-          // error 200340 if a card.action.trigger callback fires while the card
-          // is still in streaming mode.
-          pendingFormEls = buildQuestionFormElements({
-            questions: event.questions,
-            chatId,
-            threadRootId,
-          });
-          log.info(`Question form queued (${event.questions.length} questions), will append after streaming closes`);
+          // Format questions as plain text — sent after streaming closes.
+          const lines: string[] = ['**请回答以下问题：**\n'];
+          for (let i = 0; i < event.questions.length; i++) {
+            const q = event.questions[i]!;
+            lines.push(`**${i + 1}. ${q.question}**`);
+            q.options.forEach((opt, j) => {
+              const letter = String.fromCharCode(65 + j); // A, B, C...
+              const desc = opt.description ? `：${opt.description}` : '';
+              lines.push(`  ${letter}. ${opt.label}${desc}`);
+            });
+            if (q.options.length > 0) {
+              const letters = q.options.map((_, j) => String.fromCharCode(65 + j)).join('/');
+              lines.push(`  ↑ 回复 ${letters} 选择`);
+            }
+            lines.push('');
+          }
+          pendingQuestionsText = lines.join('\n');
+          log.info(`Questions formatted as text (${event.questions.length} questions), will send after streaming closes`);
         } else if (event.type === 'done') {
           const response = event.response;
           const id = await ensureCard();
@@ -517,13 +511,12 @@ export class FeishuGateway implements Gateway {
             seq++
           ).catch((e) => log.warn(`collapse steps panel failed: ${e}`));
         }
-        // Append the question form AFTER streaming mode is closed so Feishu
-        // allows card.action.trigger callbacks (streaming mode blocks them → 200340).
-        if (pendingFormEls) {
-          await appendCardElements(client, cardId, pendingFormEls, seq++).catch((e) =>
-            log.warn(`appendQuestionForm failed: ${e}`)
+        // Send questions as a plain-text message after streaming closes.
+        if (pendingQuestionsText) {
+          await sendMarkdown(client, chatId, pendingQuestionsText).catch((e) =>
+            log.warn(`sendQuestions failed: ${e}`)
           );
-          log.info(`Question form appended to card ${cardId} after streaming closed`);
+          log.info(`Questions sent as text message to ${chatId}`);
         }
       }
     }
