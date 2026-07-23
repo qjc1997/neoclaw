@@ -15,7 +15,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -403,6 +403,137 @@ async function getTenantAccessToken(): Promise<string> {
   return json.tenant_access_token;
 }
 
+// ── User (OAuth) access token ────────────────────────────────
+// The tenant token only sees chats the bot belongs to. A user_access_token
+// (obtained via scripts/feishu-oauth.mjs) lets us act as the owner and read
+// records in THEIR view. Token + refresh token are stored by that script in
+// ~/.neoclaw/feishu_user_token.json; this helper loads it and auto-refreshes.
+
+const USER_TOKEN_PATH = join(homedir(), '.neoclaw', 'feishu_user_token.json');
+const openApiHost = domain === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
+
+interface UserTokenRecord {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+  refresh_expires_at: number;
+  scope?: string;
+  saved_at?: number;
+}
+
+async function getUserAccessToken(): Promise<string> {
+  if (!existsSync(USER_TOKEN_PATH)) {
+    throw new Error(
+      'No Feishu user token found. Authorize once with: `bun run scripts/feishu-oauth.mjs` (see its header for prerequisites).'
+    );
+  }
+  const rec = JSON.parse(readFileSync(USER_TOKEN_PATH, 'utf-8')) as UserTokenRecord;
+  const now = Math.floor(Date.now() / 1000);
+  if (rec.expires_at > now) return rec.access_token;
+  if (rec.refresh_expires_at <= now) {
+    throw new Error('Feishu user token expired and refresh token is also expired — re-run scripts/feishu-oauth.mjs.');
+  }
+  // Refresh
+  const res = await fetch(`${openApiHost}/open-apis/authen/v2/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      client_id: appId,
+      client_secret: appSecret,
+      refresh_token: rec.refresh_token,
+    }),
+  });
+  const tok = (await res.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    refresh_token_expires_in?: number;
+  };
+  if (!tok.access_token) {
+    throw new Error('Feishu user token refresh failed: ' + JSON.stringify(tok));
+  }
+  const updated: UserTokenRecord = {
+    ...rec,
+    access_token: tok.access_token,
+    refresh_token: tok.refresh_token ?? rec.refresh_token,
+    expires_at: now + (tok.expires_in ?? 7200) - 60,
+    refresh_expires_at: tok.refresh_token_expires_in
+      ? now + tok.refresh_token_expires_in - 60
+      : rec.refresh_expires_at,
+    saved_at: now,
+  };
+  writeFileSync(USER_TOKEN_PATH, JSON.stringify(updated, null, 2) + '\n', { mode: 0o600 });
+  return tok.access_token;
+}
+
+/** List all chats the USER (not the bot) belongs to. */
+async function listMyChats(): Promise<string> {
+  const token = await getUserAccessToken();
+  const chats: string[] = [];
+  let pageToken = '';
+  do {
+    const url = `${openApiHost}/open-apis/im/v1/chats?page_size=100${pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : ''}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const json = (await res.json()) as {
+      code: number;
+      msg?: string;
+      data?: { items?: Array<{ chat_id?: string; name?: string; description?: string }>; page_token?: string; has_more?: boolean };
+    };
+    if (json.code !== 0) return `Error listing chats: ${json.code} ${json.msg ?? ''}`;
+    for (const it of json.data?.items ?? []) {
+      chats.push(`${it.chat_id}\t${it.name || '(no name)'}${it.description ? ' — ' + it.description : ''}`);
+    }
+    pageToken = json.data?.has_more ? (json.data?.page_token ?? '') : '';
+  } while (pageToken);
+  return chats.length ? `${chats.length} chats you're in:\n${chats.join('\n')}` : 'You are in no chats (or scope missing).';
+}
+
+/** Read messages from a chat AS THE USER (includes messages not involving the bot). */
+async function readChatAsUser(
+  chatId: string,
+  opts: { count?: number; startTime?: string; endTime?: string }
+): Promise<string> {
+  const token = await getUserAccessToken();
+  const limit = Math.max(1, Math.min(500, opts.count ?? 100));
+  const out: string[] = [];
+  let pageToken = '';
+  while (out.length < limit) {
+    const params = new URLSearchParams({
+      container_id_type: 'chat',
+      container_id: chatId,
+      sort_type: 'ByCreateTimeDesc',
+      page_size: String(Math.min(50, limit - out.length)),
+    });
+    if (opts.startTime) params.set('start_time', opts.startTime);
+    if (opts.endTime) params.set('end_time', opts.endTime);
+    if (pageToken) params.set('page_token', pageToken);
+    const res = await fetch(`${openApiHost}/open-apis/im/v1/messages?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = (await res.json()) as {
+      code: number;
+      msg?: string;
+      data?: {
+        items?: Array<{ create_time?: string; msg_type?: string; sender?: { id?: string }; body?: { content?: string } }>;
+        page_token?: string;
+        has_more?: boolean;
+      };
+    };
+    if (json.code !== 0) return `Error reading chat: ${json.code} ${json.msg ?? ''}`;
+    for (const m of json.data?.items ?? []) {
+      const sender = m.sender?.id ?? 'unknown';
+      const ts = m.create_time ? new Date(parseInt(m.create_time)).toISOString() : '';
+      const text = extractText(m.body?.content ?? '', m.msg_type ?? 'text');
+      out.push(`[${ts}] ${sender}: ${text}`);
+    }
+    pageToken = json.data?.has_more ? (json.data?.page_token ?? '') : '';
+    if (!pageToken) break;
+  }
+  // API returns newest-first; reverse to chronological for readability
+  return out.length ? out.reverse().join('\n') : 'No messages in range.';
+}
+
 async function uploadAndSendFile(opts: {
   chatId: string;
   filePath: string;
@@ -601,6 +732,68 @@ async function readDocument(input: string): Promise<{ content: string; error?: s
   }
 }
 
+/**
+ * Create a new Feishu docx document, optionally with plain-text content
+ * (each line becomes a paragraph block). Optionally place it in a Drive folder.
+ * Returns the new document_id and a share URL. Requires the Feishu app to have
+ * docx create/write permission (scope docx:document).
+ */
+async function createDocument(opts: {
+  title: string;
+  content?: string;
+  folderToken?: string;
+}): Promise<{ documentId: string; url: string; contentWarning?: string } | { error: string }> {
+  if (!appId || !appSecret) {
+    return { error: 'Feishu credentials not configured' };
+  }
+  try {
+    const accessToken = await getTenantAccessToken();
+
+    // 1. Create the (empty) document
+    const body: Record<string, string> = { title: opts.title };
+    if (opts.folderToken) body['folder_token'] = opts.folderToken;
+    const createRes = await fetch('https://open.feishu.cn/open-apis/docx/v1/documents', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const createJson = (await createRes.json()) as {
+      code: number;
+      msg?: string;
+      data?: { document?: { document_id?: string } };
+    };
+    if (createJson.code !== 0 || !createJson.data?.document?.document_id) {
+      return { error: `Create docx failed ${createJson.code}: ${createJson.msg ?? ''}` };
+    }
+    const documentId = createJson.data.document.document_id;
+    const url = `https://feishu.cn/docx/${documentId}`;
+
+    // 2. Optionally insert plain-text content as paragraph blocks (one per line)
+    let contentWarning: string | undefined;
+    if (opts.content && opts.content.trim()) {
+      const children = opts.content.split('\n').map((line) => ({
+        block_type: 2, // 2 = Text (paragraph)
+        text: { elements: [{ text_run: { content: line } }] },
+      }));
+      const blockRes = await fetch(
+        `https://open.feishu.cn/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(documentId)}/children`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: 0, children }),
+        }
+      );
+      const blockJson = (await blockRes.json()) as { code: number; msg?: string };
+      if (blockJson.code !== 0) {
+        contentWarning = `Document created but content insert failed ${blockJson.code}: ${blockJson.msg ?? ''}`;
+      }
+    }
+    return { documentId, url, contentWarning };
+  } catch (err) {
+    return { error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 // ── MCP Server ───────────────────────────────────────────────
 
 const server = new Server(
@@ -648,6 +841,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               'Feishu document URL or token. Supported formats: wiki URL, docx URL, doc URL, or plain token string.',
           },
+        },
+      },
+    },
+    {
+      name: 'feishu_create_document',
+      description:
+        "Create a new Feishu (Lark) cloud document (docx). Provide a title and optional plain-text content — each line of content becomes a paragraph. Optionally provide a folder_token to place the doc inside a specific Drive folder (otherwise it lands in the app's space root). Returns the new document's share URL. Requires the Feishu app to have docx create/write permission (scope docx:document).",
+      inputSchema: {
+        type: 'object' as const,
+        required: ['title'],
+        properties: {
+          title: {
+            type: 'string',
+            description: 'Title of the new document.',
+          },
+          content: {
+            type: 'string',
+            description:
+              'Optional initial plain-text content. Each newline becomes a separate paragraph block.',
+          },
+          folder_token: {
+            type: 'string',
+            description:
+              'Optional Drive folder token to create the document inside a specific folder.',
+          },
+        },
+      },
+    },
+    {
+      name: 'feishu_list_my_chats',
+      description:
+        "List all chats the OWNER (you) belong to, acting as the user via their OAuth token — NOT limited to chats the bot is in. Use this to discover chat_ids for feishu_read_chat_as_me when searching/analyzing the owner's own conversations. Requires a user token (run scripts/feishu-oauth.mjs once).",
+      inputSchema: { type: 'object' as const, properties: {} },
+    },
+    {
+      name: 'feishu_read_chat_as_me',
+      description:
+        "Read a chat's message history AS THE OWNER (user token), so it includes human-to-human messages the bot was never part of. Returns chronological 'timestamp sender_open_id: text' lines. Use with a keyword/time range to gather records for analysis or summary. Requires a user token (run scripts/feishu-oauth.mjs once).",
+      inputSchema: {
+        type: 'object' as const,
+        required: ['chat_id'],
+        properties: {
+          chat_id: { type: 'string', description: 'Target chat ID (starts with "oc_"). Get it from feishu_list_my_chats.' },
+          count: { type: 'number', description: 'Max messages to fetch (1–500, default 100).' },
+          start_time: { type: 'string', description: 'Optional lower bound, Unix seconds (string).' },
+          end_time: { type: 'string', description: 'Optional upper bound, Unix seconds (string).' },
         },
       },
     },
@@ -958,6 +1197,55 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: 'Document is empty or has no readable content.' }] };
     }
     return { content: [{ type: 'text', text: result.content }] };
+  }
+
+  if (name === 'feishu_create_document') {
+    const title = args?.['title'] as string;
+    if (!title) {
+      return { content: [{ type: 'text', text: 'Error: title is required.' }] };
+    }
+    const result = await createDocument({
+      title,
+      content: args?.['content'] as string | undefined,
+      folderToken: args?.['folder_token'] as string | undefined,
+    });
+    if ('error' in result) {
+      return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+    }
+    const warn = result.contentWarning ? `\n⚠️ ${result.contentWarning}` : '';
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Document created: ${result.url}\ndocument_id: ${result.documentId}${warn}`,
+        },
+      ],
+    };
+  }
+
+  if (name === 'feishu_list_my_chats') {
+    try {
+      return { content: [{ type: 'text', text: await listMyChats() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+  }
+
+  if (name === 'feishu_read_chat_as_me') {
+    const chatId = args?.['chat_id'] as string;
+    if (!chatId) {
+      return { content: [{ type: 'text', text: 'Error: chat_id is required.' }] };
+    }
+    try {
+      const text = await readChatAsUser(chatId, {
+        count: args?.['count'] as number | undefined,
+        startTime: args?.['start_time'] as string | undefined,
+        endTime: args?.['end_time'] as string | undefined,
+      });
+      return { content: [{ type: 'text', text }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
   }
 
   if (name !== 'feishu_get_history') {

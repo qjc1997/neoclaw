@@ -152,6 +152,12 @@ type ResultEvent = {
     { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }
   >;
   permission_denials?: PermissionDenial[];
+  // Present on results that are the deferred completion of a BACKGROUND task
+  // (subagent finishing after its spawning turn already ended). `kind` is
+  // "task-notification" for these. Such results are NOT the reply to the
+  // prompt the caller just sent — see ClaudeProcess.exchange for why this
+  // distinction prevents a one-message reply drift.
+  origin?: { kind?: string } | null;
 };
 
 /** Extract AskUserQuestion tool inputs from permission_denials. Returns null if none. */
@@ -311,6 +317,16 @@ class ClaudeProcess {
           const r = evt as ResultEvent;
           if (r.session_id) this._sessionId = r.session_id;
           yield evt;
+          // A `task-notification` result is the deferred completion of a
+          // background subagent, NOT the reply to the prompt we just wrote.
+          // If we returned here, the NEXT exchange() would consume this stray
+          // result as its answer, drifting every reply one message behind
+          // (the classic "each answer is for the previous question" bug).
+          // Keep reading until the real terminal result for THIS prompt lands.
+          if (r.origin?.kind === 'task-notification') {
+            log.info('exchange: bypassed background task-notification result; awaiting real result');
+            continue;
+          }
           return;
         }
 
@@ -533,7 +549,18 @@ export class ClaudeCodeAgent implements Agent {
             }
           }
         } else if (evt.type === 'result') {
-          resultEvt = evt as ResultEvent;
+          const r = evt as ResultEvent;
+          if (r.origin?.kind === 'task-notification') {
+            // Deferred background-subagent output. Surface its text in-band so
+            // it isn't lost, but it is NOT this turn's terminal result — that
+            // still comes from the prompt we sent (see ClaudeProcess.exchange).
+            if (r.result) {
+              textParts.push(r.result);
+              yield { type: 'text_delta', text: r.result };
+            }
+          } else {
+            resultEvt = r;
+          }
         }
       }
     } finally {
