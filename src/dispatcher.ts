@@ -889,6 +889,7 @@ export class Dispatcher {
               '- `haiku` — latest Claude Haiku (fastest, lightweight)',
               '',
               'You can also pass a full model ID, e.g. `claude-opus-4-7` or `claude-sonnet-4-6`.',
+              'Or use `ollama:<model>` to route this conversation to a local Ollama model, e.g. `ollama:qwen3:14b`.',
               '',
               'Usage: `/model <name|id>` to change, `/model reset` to use default.',
             ].join('\n'),
@@ -898,9 +899,9 @@ export class Dispatcher {
           await agent.setModel(key, null);
           return { text: 'Model reset to default. Takes effect on next message.' };
         }
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(args)) {
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9.:_-]*$/.test(args)) {
           return {
-            text: `Invalid model **${args}**. Use an alias (\`sonnet\`, \`opus\`, \`haiku\`) or a full model ID like \`claude-opus-4-7\`.`,
+            text: `Invalid model **${args}**. Use an alias (\`sonnet\`, \`opus\`, \`haiku\`), a full model ID like \`claude-opus-4-7\`, or \`ollama:<model>\` for a local Ollama model.`,
           };
         }
         await agent.setModel(key, args);

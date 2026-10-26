@@ -45,6 +45,8 @@ Gateway.start(dispatcher.handle)
 
 The `stream()` method on `ClaudeCodeAgent` yields `AgentStreamEvent`s: `thinking_delta` and `text_delta` are emitted for each JSONL `content_block_delta`; a final `done` event carries the full `RunResponse` (including stats).
 
+**Per-conversation Ollama routing**: a model set to `ollama:<model>` (e.g. via `/model ollama:qwen3:14b`) routes that conversation to a local Ollama instance. The `ollama:` prefix is stripped to get the real model name, and the subprocess gets `ANTHROPIC_BASE_URL` pointed at `http://localhost:11434` (overridable via `opts.backendUrl`) with `ANTHROPIC_API_KEY=local` (overridable via `opts.backendKey`). This is resolved per-conversation in `_startProcess()`; without the prefix, the global `opts.backendUrl`/`opts.backendKey` (if any) still apply. The `/model` command's validation regex allows colons so `ollama:<model>` passes.
+
 **Gateways**: `FeishuGateway` (Feishu/Lark WebSocket). Handles:
 - Reaction emoji lifecycle (`OneSecond` emoji added on receive, removed after reply)
 - Reply threading (replies are sent as thread replies to the original message)

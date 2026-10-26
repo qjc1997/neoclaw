@@ -1189,8 +1189,16 @@ export class ClaudeCodeAgent implements Agent {
 
     const resumeSessionId = this._sessionIds.get(conversationId);
     const effectiveModel = this._modelOverrides.get(conversationId) ?? this.opts.model;
+
+    // `ollama:<model>` prefix routes this conversation to a local Ollama instance.
+    // Strip the prefix and point ANTHROPIC_BASE_URL at localhost:11434.
+    const isOllama = effectiveModel?.startsWith('ollama:');
+    const resolvedModel = isOllama ? effectiveModel!.slice('ollama:'.length) : effectiveModel;
+    const backendUrl = isOllama ? (this.opts.backendUrl ?? 'http://localhost:11434') : this.opts.backendUrl;
+    const backendKey = isOllama ? (this.opts.backendKey ?? 'local') : this.opts.backendKey;
+
     const proc = new ClaudeProcess({
-      model: effectiveModel,
+      model: resolvedModel,
       allowedTools: this.opts.allowedTools,
       systemPrompt: this.opts.systemPrompt ?? null,
       cwd: this._conversationCwd(conversationId, request.authorId),
@@ -1203,9 +1211,9 @@ export class ClaudeCodeAgent implements Agent {
         ...(request.authorId ? { NEOCLAW_AUTHOR_ID: request.authorId } : {}),
         // Custom LLM backend (e.g. local Ollama). When set, redirects the claude CLI
         // to a different API endpoint instead of api.anthropic.com.
-        ...(this.opts.backendUrl ? {
-          ANTHROPIC_BASE_URL: this.opts.backendUrl,
-          ANTHROPIC_API_KEY: this.opts.backendKey ?? 'local',
+        ...(backendUrl ? {
+          ANTHROPIC_BASE_URL: backendUrl,
+          ANTHROPIC_API_KEY: backendKey ?? 'local',
         } : {}),
       },
     });
