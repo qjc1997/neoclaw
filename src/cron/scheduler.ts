@@ -27,6 +27,10 @@ const POLL_INTERVAL_MS = 30_000; // 30 seconds
  *
  * Supported syntax per field: *, N, N-M, N/step, *\/step, N,M,...
  */
+// How far back (in ms) we look for a missed cron slot. Covers daemon restarts
+// and the rare case where the 30s poll lands a few seconds past the target minute.
+const CATCHUP_WINDOW_MS = 5 * 60_000; // 5 minutes
+
 function matchesCron(expr: string, now: Date, lastRunAt: Date | null): boolean {
   // Prevent double-fire within the same cron period
   if (lastRunAt && now.getTime() - lastRunAt.getTime() < 50_000) return false;
@@ -59,13 +63,41 @@ function matchesCron(expr: string, now: Date, lastRunAt: Date | null): boolean {
     return parseInt(field, 10) === value;
   };
 
-  return (
-    matchField(minF, now.getMinutes(), 0, 59) &&
-    matchField(hourF, now.getHours(), 0, 23) &&
-    matchField(domF, now.getDate(), 1, 31) &&
-    matchField(monF, now.getMonth() + 1, 1, 12) &&
-    matchField(dowF, now.getDay(), 0, 6)
-  );
+  const slotMatches = (t: Date) =>
+    matchField(minF, t.getMinutes(), 0, 59) &&
+    matchField(hourF, t.getHours(), 0, 23) &&
+    matchField(domF, t.getDate(), 1, 31) &&
+    matchField(monF, t.getMonth() + 1, 1, 12) &&
+    matchField(dowF, t.getDay(), 0, 6);
+
+  // Primary check: exact match on the current minute
+  if (slotMatches(now)) return true;
+
+  // Catch-up check: scan backwards up to CATCHUP_WINDOW_MS for a missed slot
+  // that hasn't been run yet. This fires missed jobs after a daemon restart or
+  // a poll that landed just past the due minute.
+  for (let offset = 60_000; offset <= CATCHUP_WINDOW_MS; offset += 60_000) {
+    const candidate = new Date(now.getTime() - offset);
+    if (slotMatches(candidate)) {
+      // Floor candidate to the start of its minute so that a job which fired
+      // at e.g. 06:50:07 (lastRunAt) is correctly recognised as having already
+      // served the 06:50 slot even when candidate lands at 06:50:55.
+      // Without this, lastRunAt(06:50:07) < candidate(06:50:55) would be true
+      // and the slot would re-fire — the root cause of the duplicate-fire bug.
+      const slotStart = new Date(
+        candidate.getFullYear(),
+        candidate.getMonth(),
+        candidate.getDate(),
+        candidate.getHours(),
+        candidate.getMinutes(),
+        0, 0
+      );
+      if (!lastRunAt || lastRunAt.getTime() < slotStart.getTime()) return true;
+      break; // found the slot but already ran — no need to look further back
+    }
+  }
+
+  return false;
 }
 
 // ── CronScheduler ─────────────────────────────────────────────

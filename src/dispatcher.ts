@@ -9,8 +9,9 @@
  * - Handle built-in slash commands (/clear, /status, /restart, /stop, /help)
  */
 
-import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { Agent, AgentStreamEvent, RunRequest, RunResponse } from './agents/types.js';
 import type {
   Gateway,
@@ -24,8 +25,10 @@ import { readReviewTarget, REVIEW_TARGET_FILE, runCodeReview, validateExternalTa
 import type { MemoryManager } from './memory/manager.js';
 import { SpeechProcessor } from './speech/index.js';
 import type { SpeechConfig } from './speech/index.js';
+import { isBackendErrorText } from './utils/backend-errors.js';
 import { buildContextWarning } from './utils/context.js';
 import { recordCost } from './utils/cost-tracker.js';
+import { createDebouncedFlush } from './utils/debounced-flush.js';
 import { logger } from './utils/logger.js';
 import { Mutex } from './utils/mutex.js';
 
@@ -48,6 +51,81 @@ function extractMutatedFile(name: string, input: unknown): string | null {
   return typeof path === 'string' ? path : null;
 }
 
+// ── English coach helper ──────────────────────────────────────
+
+/**
+ * Strip bot @mention suffixes (e.g. "@_user_1") and sender prefixes
+ * (e.g. "ou_xxx: ") from a message before sending to the English coach.
+ */
+function _stripMentions(text: string): string {
+  return text
+    .replace(/@_user_\d+/g, '')   // strip @_user_1 style mentions
+    .replace(/^[a-zA-Z0-9_]+:\s*/, '') // strip "ou_xxx: " sender prefix
+    .trim();
+}
+
+const _isCjk = (c: string): boolean => {
+  const cp = c.codePointAt(0) ?? 0;
+  return (cp >= 0x4e00 && cp <= 0x9fff)   // CJK Unified Ideographs
+      || (cp >= 0x3400 && cp <= 0x4dbf)   // CJK Extension A
+      || (cp >= 0x20000 && cp <= 0x2a6df); // CJK Extension B
+};
+
+/**
+ * Drop tokens that are language-neutral — URLs, file paths, identifiers like
+ * `notion-daily-log-rules` or `{date, notion_url}` — so they don't swamp the
+ * language ratio. A Chinese instruction full of paths is still Chinese.
+ */
+function _proseOnly(text: string): string {
+  return text
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[~.]?\/[^\s，。、；：）)]+/g, ' ')        // paths
+    .replace(/\{[^}]*\}|`[^`]*`/g, ' ')               // {…} and `code`
+    .replace(/\b[\w]+[-_.][\w.-]*\b/g, ' ');           // kebab/snake/dotted ids
+}
+
+/**
+ * Returns true if the message looks like natural English prose worth coaching:
+ * - At least 20 non-whitespace characters
+ * - At least 8 alphabetic characters (filters out code/file paths/URLs/numbers)
+ * - >80% of non-whitespace chars are ASCII (rules out Chinese/Japanese/Korean)
+ * - Does not look like a file path or shell command (no leading / or ~/)
+ * - Contains at least 3 words
+ */
+function _looksLikeEnglish(text: string): boolean {
+  const clean = _stripMentions(text);
+  if (clean.startsWith('/') || clean.startsWith('~/') || clean.startsWith('http')) return false;
+  const words = clean.trim().split(/\s+/);
+  if (words.length < 3) return false;
+  const stripped = clean.replace(/\s+/g, '');
+  if (stripped.length < 20) return false;
+  const alphaCount = (clean.match(/[a-zA-Z]/g) ?? []).length;
+  if (alphaCount < 8) return false;
+  // Any real Chinese means it isn't English prose (paths/ids can push the
+  // ASCII ratio of a Chinese instruction past 90%).
+  if ([...stripped].filter(_isCjk).length >= 2) return false;
+  const asciiCount = [...stripped].filter((c) => c.charCodeAt(0) < 128).length;
+  return asciiCount / stripped.length > 0.8;
+}
+
+/**
+ * Returns true if the message is predominantly Chinese (CJK characters):
+ * - At least 6 CJK characters
+ * - >40% of non-whitespace chars are CJK
+ * - Does not look like a command or URL
+ */
+function _looksLikeChinese(text: string): boolean {
+  const clean = _stripMentions(text);
+  if (clean.startsWith('/') || clean.startsWith('http')) return false;
+  const stripped = _proseOnly(clean).replace(/\s+/g, '');
+  if (stripped.length < 6) return false;
+  const cjkCount = [...stripped].filter(_isCjk).length;
+  // Weigh by words, not chars: one CJK char ≈ one word ≈ ~4 Latin letters,
+  // so English terms mixed into a Chinese sentence don't outvote it.
+  const latinWords = (stripped.match(/[a-zA-Z]/g) ?? []).length / 4;
+  return cjkCount >= 6 && cjkCount / (cjkCount + latinWords) > 0.4;
+}
+
 // ── Dispatcher ────────────────────────────────────────────────
 
 /** Callback invoked when the /restart command is received. */
@@ -60,6 +138,63 @@ type PendingMessage = {
 };
 
 export class Dispatcher {
+
+  private _agentOverrides = new Map<string, string>();
+  private _flushAgentOverrides = createDebouncedFlush(() => {
+    try {
+      const dir = join(homedir(), '.neoclaw', 'cache');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const data = Object.fromEntries(this._agentOverrides);
+      writeFileSync(join(dir, 'agent-overrides.json'), JSON.stringify(data, null, 2));
+    } catch (err) {
+      log.warn(`Failed to flush agent overrides: ${err}`);
+    }
+  }, 2000);
+
+  /**
+   * chatIds where the English coach is explicitly disabled.
+   * Feature is ON by default; this set tracks opt-outs.
+   * Persisted to ~/.neoclaw/cache/english-coach-disabled.json.
+   */
+  private _englishCoachDisabled = new Set<string>();
+  private _flushEnglishCoach = createDebouncedFlush(() => {
+    try {
+      const dir = join(homedir(), '.neoclaw', 'cache');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, 'english-coach-disabled.json'),
+        JSON.stringify([...this._englishCoachDisabled], null, 2)
+      );
+    } catch (err) {
+      log.warn(`Failed to flush english coach state: ${err}`);
+    }
+  }, 2000);
+
+  constructor() {
+    try {
+      const path = join(homedir(), '.neoclaw', 'cache', 'agent-overrides.json');
+      if (existsSync(path)) {
+        const data = JSON.parse(readFileSync(path, 'utf-8'));
+        for (const [k, v] of Object.entries(data)) {
+          this._agentOverrides.set(k, v as string);
+        }
+      }
+    } catch {}
+    try {
+      const path = join(homedir(), '.neoclaw', 'cache', 'english-coach-disabled.json');
+      if (existsSync(path)) {
+        const list = JSON.parse(readFileSync(path, 'utf-8')) as string[];
+        for (const id of list) this._englishCoachDisabled.add(id);
+      }
+    } catch {}
+    try {
+      const path = join(homedir(), '.neoclaw', 'cache', 'cleared-chats.json');
+      if (existsSync(path)) {
+        const list = JSON.parse(readFileSync(path, 'utf-8')) as string[];
+        for (const id of list) this._clearedChats.add(id);
+      }
+    } catch {}
+  }
   private _agents = new Map<string, Agent>();
   private _defaultAgentKind = 'claude_code';
   private _gateways: Gateway[] = [];
@@ -83,11 +218,33 @@ export class Dispatcher {
   private _onRestart: RestartCallback | null = null;
   private _speechProcessor: SpeechProcessor | null = null;
   private _codeReviewConfig: CodeReviewConfig | null = null;
+  /**
+   * Feishu group chatIds that were just /clear-ed and are waiting for their
+   * first message to trigger an auto-rename based on the Q&A content.
+   * Persisted to ~/.neoclaw/cache/cleared-chats.json — the first message after
+   * a /clear can arrive days later, across daemon restarts.
+   */
+  private _clearedChats = new Set<string>();
+  private _flushClearedChats = createDebouncedFlush(() => {
+    try {
+      const dir = join(homedir(), '.neoclaw', 'cache');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'cleared-chats.json'), JSON.stringify([...this._clearedChats], null, 2));
+    } catch (err) {
+      log.warn(`Failed to flush cleared chats: ${err}`);
+    }
+  }, 2000);
 
   // ── Registration ──────────────────────────────────────────
 
   addAgent(agent: Agent): void {
     this._agents.set(agent.kind, agent);
+    agent.setUnsolicitedHandler?.(({ conversationId, chatId, gatewayKind, response }) => {
+      this._appendHistory(conversationId, 'neoclaw', response.text);
+      this.sendTo(gatewayKind, chatId, response).catch((err) =>
+        log.warn(`Failed to deliver unsolicited output for "${conversationId}": ${err}`)
+      );
+    });
     log.info(`Agent registered: "${agent.kind}"`);
   }
 
@@ -149,7 +306,7 @@ export class Dispatcher {
     // would queue up behind the very stream it's trying to abort.
     const earlyCmd = this._tryParseCommand(msg.text);
     if (earlyCmd?.name === 'stop') {
-      const agent = this._getAgent();
+      const agent = this._getAgent(key);
       const aborted = agent.cancel ? await agent.cancel(key) : false;
       const replyText = aborted
         ? '⛔️ Stopped the current response. Next message will continue the conversation if possible.'
@@ -242,7 +399,7 @@ export class Dispatcher {
           }
         }
 
-        const agent = this._getAgent();
+        const agent = this._getAgent(key);
         const request: RunRequest = {
           text: processedText,
           conversationId: key,
@@ -263,13 +420,16 @@ export class Dispatcher {
                 if (mutated) mutatedFiles.add(mutated);
               }
               if (event.type === 'done') {
-                const warning = buildContextWarning(event.response.inputTokens, event.response.contextWindow, event.response.model);
+                const warning = buildContextWarning(event.response.contextTokens, event.response.contextWindow, event.response.model);
                 if (warning) {
                   event = {
                     ...event,
                     response: { ...event.response, text: event.response.text + warning },
                   };
-                  log.warn(`Context usage ${event.response.inputTokens} tokens exceeds threshold for "${key}"`);
+                  log.warn(`Context usage ${event.response.contextTokens} tokens exceeds threshold for "${key}"`);
+                }
+                if (event.response.isError) {
+                  log.error(`Agent reported a failed turn for "${key}": ${event.response.text.slice(0, 300)}`);
                 }
                 responseText = event.response.text;
                 recordCost({
@@ -289,10 +449,13 @@ export class Dispatcher {
         } else {
           // Non-streaming fallback
           const response = await agent.run(request);
-          const warning = buildContextWarning(response.inputTokens, response.contextWindow, response.model);
+          const warning = buildContextWarning(response.contextTokens, response.contextWindow, response.model);
           if (warning) {
             response.text += warning;
-            log.warn(`Context usage ${response.inputTokens} tokens exceeds threshold for "${key}"`);
+            log.warn(`Context usage ${response.contextTokens} tokens exceeds threshold for "${key}"`);
+          }
+          if (response.isError) {
+            log.error(`Agent reported a failed turn for "${key}": ${response.text.slice(0, 300)}`);
           }
           responseText = response.text;
           recordCost({
@@ -312,6 +475,47 @@ export class Dispatcher {
       this._appendHistory(key, 'user', msg.text);
       this._appendHistory(key, 'neoclaw', responseText);
       this._updateCurrentAuthor(key, msg.authorId);
+
+      // Auto-rename: first non-command message after /clear in a Feishu group chat
+      if (
+        !command &&
+        msg.gatewayKind === 'feishu' &&
+        msg.meta?.chatType === 'group' &&
+        key === msg.chatId &&
+        this._clearedChats.has(msg.chatId)
+      ) {
+        this._clearedChats.delete(msg.chatId);
+        this._flushClearedChats();
+        this._autoRenameChatFromExchange(msg.chatId, msg.text, responseText).catch((err) =>
+          log.warn(`Auto chat rename failed: ${err}`)
+        );
+      }
+
+      // English coach: suggest native phrasing for English messages (Feishu only)
+      if (
+        !command &&
+        msg.gatewayKind === 'feishu' &&
+        msg.authorId !== 'cron' &&
+        !this._englishCoachDisabled.has(msg.chatId) &&
+        _looksLikeEnglish(_stripMentions(msg.text))
+      ) {
+        this._runEnglishCoach(msg).catch((err) =>
+          log.warn(`English coach failed: ${err}`)
+        );
+      }
+
+      // English coach (Chinese branch): suggest how to ask the same question in English
+      if (
+        !command &&
+        msg.gatewayKind === 'feishu' &&
+        msg.authorId !== 'cron' &&
+        !this._englishCoachDisabled.has(msg.chatId) &&
+        _looksLikeChinese(_stripMentions(msg.text))
+      ) {
+        this._runChineseToEnglishCoach(msg).catch((err) =>
+          log.warn(`Chinese→English coach failed: ${err}`)
+        );
+      }
 
       // Auto-trigger code review when the agent either edited files via the
       // file tools (Edit/Write/MultiEdit/NotebookEdit) or invoked Bash — Bash
@@ -340,6 +544,42 @@ export class Dispatcher {
     const item = queue.shift();
     if (queue.length === 0) this._pendingMessages.delete(key);
     return item;
+  }
+
+  /**
+   * Generate a ≤3-word chat name from a Q&A exchange and rename the group.
+   * Uses the summary model (haiku by default) via a single-shot `claude -p` call.
+   * Runs in the background — never throws to the caller.
+   */
+  private async _autoRenameChatFromExchange(
+    chatId: string,
+    question: string,
+    answer: string
+  ): Promise<void> {
+    const gw = this._gateways.find((g) => g.kind === 'feishu');
+    if (!gw?.setChatName) return;
+
+    const q = question.slice(0, 400);
+    const a = answer.slice(0, 400);
+    const prompt =
+      'Generate a group chat name of no more than 3 words that captures the main topic of this exchange. ' +
+      'Use the same language as the conversation (Chinese or English). ' +
+      'Return ONLY the name — no punctuation, no quotes, no explanation.\n\n' +
+      `Q: ${q}\nA: ${a}`;
+
+    const result = Bun.spawnSync(['claude', '--model', 'haiku', '-p', prompt], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    const name = result.stdout.toString().trim().replace(/^["'「」【】]+|["'「」【】]+$/g, '').trim();
+    if (!name) {
+      log.warn('Auto-rename: empty title generated, skipping');
+      return;
+    }
+
+    log.info(`Auto-rename chat ${chatId} → "${name}"`);
+    await gw.setChatName(chatId, name);
   }
 
   /** Run code review on the workspace and send result to the originating chat. */
@@ -462,7 +702,7 @@ export class Dispatcher {
    * Gateways keep the same `handle` reference and automatically use the new agent.
    */
   async reload(opts: {
-    agent: Agent;
+    agents: Agent[];
     defaultAgentKind?: string;
     workspacesDir?: string;
     memoryManager?: MemoryManager;
@@ -473,7 +713,9 @@ export class Dispatcher {
       await agent.dispose().catch((e) => log.warn(`Agent dispose during reload: ${e}`));
     }
     this._agents.clear();
-    this.addAgent(opts.agent);
+    for (const agent of opts.agents) {
+      this.addAgent(agent);
+    }
     if (opts.defaultAgentKind) this._defaultAgentKind = opts.defaultAgentKind;
     if (opts.workspacesDir) this._workspacesDir = opts.workspacesDir;
     if (opts.memoryManager) this._memoryManager = opts.memoryManager;
@@ -519,8 +761,10 @@ export class Dispatcher {
     return q;
   }
 
-  private _getAgent(): Agent {
-    const agent = this._agents.get(this._defaultAgentKind);
+  private _getAgent(key?: string): Agent {
+    const kind = (key && this._agentOverrides.get(key)) || this._defaultAgentKind;
+    let agent = this._agents.get(kind);
+    if (!agent) agent = this._agents.get(this._defaultAgentKind);
     if (!agent) {
       const available = [...this._agents.keys()].join(', ');
       throw new Error(`Agent "${this._defaultAgentKind}" not registered. Available: ${available}`);
@@ -530,7 +774,7 @@ export class Dispatcher {
 
   // ── Built-in slash commands ──────────────────────────────
 
-  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model', 'compress', 'review', 'stop']);
+  private static readonly COMMANDS = new Set(['clear', 'new', 'status', 'restart', 'help', 'model', 'compress', 'review', 'stop', 'agent', 'english']);
 
   private _tryParseCommand(text: string): { name: string; args: string } | null {
     let trimmed = text.trim();
@@ -564,8 +808,19 @@ export class Dispatcher {
             .summarizeSession(key, this._workspacesDir)
             .catch((err) => log.warn(`Failed to summarize session: ${err}`));
         }
-        const agent = this._getAgent();
+        const agent = this._getAgent(key);
         await agent.clearConversation(key);
+        // For Feishu group main chats: reset name to placeholder and mark for auto-rename
+        if (msg.gatewayKind === 'feishu' && msg.meta?.chatType === 'group' && key === msg.chatId) {
+          const gw = this._gateways.find((g) => g.kind === 'feishu');
+          if (gw?.setChatName) {
+            this._clearedChats.add(msg.chatId);
+            this._flushClearedChats();
+            gw.setChatName(msg.chatId, '💬').catch((err) =>
+              log.warn(`Failed to reset chat name on clear: ${err}`)
+            );
+          }
+        }
         return { text: 'Context cleared, ready for a new conversation.' };
       }
 
@@ -581,7 +836,7 @@ export class Dispatcher {
       }
 
       case 'status': {
-        const agent = this._getAgent();
+        const agent = this._getAgent(key);
         const agents = [...this._agents.keys()].join(', ');
         const gateways = this._gateways.map((g) => g.kind).join(', ');
         const model = agent.getModel ? (agent.getModel(key) ?? 'default') : 'unknown';
@@ -595,8 +850,30 @@ export class Dispatcher {
         return { text: lines.join('\n') };
       }
 
+      
+      case 'agent': {
+        if (!args) {
+          const current = this._agentOverrides.get(key) ?? this._defaultAgentKind;
+          const available = [...this._agents.keys()].join(', ');
+          return {
+            text: `Current agent: **${current}**\nAvailable: ${available}\n\nUsage: \`/agent <name>\` to change, \`/agent reset\` to use default.`
+          };
+        }
+        if (args === 'reset' || args === 'default') {
+          this._agentOverrides.delete(key);
+          this._flushAgentOverrides();
+          return { text: 'Agent reset to default.' };
+        }
+        if (!this._agents.has(args)) {
+          return { text: `Unknown agent **${args}**. Available: ${[...this._agents.keys()].join(', ')}` };
+        }
+        this._agentOverrides.set(key, args);
+        this._flushAgentOverrides();
+        return { text: `Agent set to **${args}** for this conversation.` };
+      }
+
       case 'model': {
-        const agent = this._getAgent();
+        const agent = this._getAgent(key);
         if (!agent.setModel || !agent.getModel) {
           return { text: 'Model override is not supported by the current agent.' };
         }
@@ -643,7 +920,7 @@ export class Dispatcher {
           }
         }
         // 2. Clear conversation (terminate subprocess, drop session ID)
-        const compressAgent = this._getAgent();
+        const compressAgent = this._getAgent(key);
         await compressAgent.clearConversation(key);
         return { text: `${summaryNote}Context compressed and cleared, ready for a new conversation.` };
       }
@@ -679,6 +956,7 @@ export class Dispatcher {
           '- `/clear` or `/new` — Start a fresh conversation',
           '- `/compress` — Summarize and compress the current session',
           '- `/stop` — Abort the current streaming response (preserves session; next message resumes)',
+          '- `/agent [name]` — Show or change the agent backend for this conversation',
           '- `/model [name]` — Show or change the model for this conversation',
           '- `/review` — Review code changes (workspace by default, or the target set via `/review target <path>`)',
           '- `/review target` — Show / set / clear the review target directory',
@@ -687,6 +965,31 @@ export class Dispatcher {
           '- `/help` — Show this help message',
         ];
         return { text: lines.join('\n') };
+      }
+
+      case 'english': {
+        const normalized = args.toLowerCase().trim();
+        if (normalized === 'off') {
+          this._englishCoachDisabled.add(msg.chatId);
+          this._flushEnglishCoach();
+          return { text: '✏️ English coach **off** for this chat.' };
+        }
+        if (normalized === 'on') {
+          this._englishCoachDisabled.delete(msg.chatId);
+          this._flushEnglishCoach();
+          return { text: '✏️ English coach **on** for this chat.' };
+        }
+        // No args → toggle
+        const wasDisabled = this._englishCoachDisabled.has(msg.chatId);
+        if (wasDisabled) {
+          this._englishCoachDisabled.delete(msg.chatId);
+          this._flushEnglishCoach();
+          return { text: '✏️ English coach **on** for this chat.' };
+        } else {
+          this._englishCoachDisabled.add(msg.chatId);
+          this._flushEnglishCoach();
+          return { text: '✏️ English coach **off** for this chat.' };
+        }
       }
 
       default:
@@ -713,6 +1016,91 @@ export class Dispatcher {
    * Persist the current message sender's ID to a file so the Feishu MCP server
    * can read it at tool-call time for dynamic @mention.
    */
+  /**
+   * Run a one-shot `claude -p` coach prompt, returning its output or null if
+   * the CLI failed.
+   *
+   * The CLI writes its own failures (expired OAuth, rate limits, low balance)
+   * to STDOUT and exits non-zero. The callers post whatever comes back
+   * straight into the chat, so without these two guards a backend outage was
+   * @mentioned at users as coaching advice.
+   *
+   * Uses async Bun.spawn (not spawnSync) so the event loop stays unblocked
+   * while haiku runs — incoming messages can be processed concurrently.
+   */
+  private async _runCoachPrompt(prompt: string): Promise<string | null> {
+    const proc = Bun.spawn(['claude', '--model', 'haiku', '-p', prompt], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    const out = stdout.trim();
+    if (exitCode !== 0) {
+      log.warn(`Coach CLI exited ${exitCode}, suppressed: ${(stderr.trim() || out).slice(0, 200)}`);
+      return null;
+    }
+    // Belt and braces: some CLI failures still exit 0.
+    if (isBackendErrorText(out)) {
+      log.warn(`Coach CLI returned a backend error, suppressed: ${out.slice(0, 200)}`);
+      return null;
+    }
+    return out || null;
+  }
+
+  /**
+   * Call haiku to suggest more natural English phrasing for the sender's message.
+   * Sends an independent @mention message if haiku finds something to improve.
+   * Runs fire-and-forget — never blocks the main response.
+   */
+  private async _runEnglishCoach(msg: InboundMessage): Promise<void> {
+    const cleanText = _stripMentions(msg.text);
+    const prompt =
+      'You are a concise English writing coach. Review the message below.\n' +
+      'If it has grammar errors, unnatural phrasing, or non-native word choices, reply with:\n' +
+      '**Suggestion:** <rewritten version>\n' +
+      '**Reason:** <one short phrase, ≤10 words>\n' +
+      'If the message is already natural, reply with exactly: OK\n\n' +
+      `Message: ${cleanText}`;
+
+    const suggestion = await this._runCoachPrompt(prompt);
+    // Anything other than the requested format (e.g. "This message is in
+    // Chinese…") is the model declining — don't post it.
+    if (!suggestion || !suggestion.startsWith('**Suggestion:**')) return;
+
+    const mention = msg.authorId ? `<at id=${msg.authorId}></at> ` : '';
+    await this.sendTo(msg.gatewayKind, msg.chatId, {
+      text: `✏️ ${mention}\n> ${cleanText}\n\n${suggestion}`,
+    });
+  }
+
+  /**
+   * Chinese → English coach: given a Chinese message, reply with a natural
+   * English phrasing of the same question/request.
+   */
+  private async _runChineseToEnglishCoach(msg: InboundMessage): Promise<void> {
+    const cleanText = _stripMentions(msg.text);
+    const prompt =
+      'You are a concise bilingual writing coach.\n' +
+      'The user wrote the message below in Chinese. Provide the most natural English way to express the same question or request.\n' +
+      'Reply with exactly:\n' +
+      '**🇬🇧 In English:** <natural English version>\n' +
+      'Keep it short and conversational. Do not add explanations.\n\n' +
+      `Message: ${cleanText}`;
+
+    const suggestion = await this._runCoachPrompt(prompt);
+    if (!suggestion) return;
+
+    const mention = msg.authorId ? `<at id=${msg.authorId}></at> ` : '';
+    await this.sendTo(msg.gatewayKind, msg.chatId, {
+      text: `✏️ ${mention}\n> ${cleanText}\n\n${suggestion}`,
+    });
+  }
+
   private _updateCurrentAuthor(conversationKey: string, authorId: string | undefined): void {
     log.info(`[author] conversationKey=${conversationKey} authorId="${authorId ?? '(empty)'}"`);
     if (!this._workspacesDir || !authorId) return;

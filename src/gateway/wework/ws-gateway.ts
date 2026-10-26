@@ -27,7 +27,7 @@ function formatStats(response: RunResponse): string | null {
   if (response.inputTokens != null) parts.push(`${response.inputTokens} in`);
   if (response.outputTokens != null) parts.push(`${response.outputTokens} out`);
   if (response.costUsd != null) parts.push(`$${response.costUsd.toFixed(4)}`);
-  const ctxPct = contextUsagePercent(response.inputTokens, response.contextWindow, response.model);
+  const ctxPct = contextUsagePercent(response.contextTokens, response.contextWindow, response.model);
   if (ctxPct != null) parts.push(`ctx ${ctxPct}%`);
   return parts.length > 0 ? parts.join(' · ') : null;
 }

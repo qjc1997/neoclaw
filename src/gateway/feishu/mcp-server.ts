@@ -341,8 +341,43 @@ async function fetchHistory(opts: {
   return { messages: formatted, hasMore: allItems.length >= opts.count };
 }
 
-// ── Send text message ────────────────────────────────────────
+// ── Send message ─────────────────────────────────────────────
 
+type PostResult = { code: number; msg?: string; data?: { message_id?: string } };
+
+/** POST one message to the IM API. */
+async function postMessage(
+  token: string,
+  idType: string,
+  body: { receive_id: string; msg_type: string; content: string }
+): Promise<PostResult> {
+  const res = await fetch(
+    `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${idType}`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  return await res.json() as PostResult;
+}
+
+/**
+ * Send a message as a rendered-Markdown interactive card.
+ *
+ * msg_type "text" is delivered verbatim — Feishu never renders Markdown in it,
+ * so headings, tables and code fences arrive as literal `#` / `|` / backticks.
+ * A JSON 2.0 card with a single `markdown` element renders the same way the
+ * streaming reply card does (see sender.ts buildCard).
+ *
+ * The two channels also spell @mentions differently: `<at user_id="...">` in a
+ * text message, `<at id=...>` inside card markdown. Getting this wrong shows the
+ * raw tag, so each branch below builds its own.
+ *
+ * Falls back to plain text if the card is rejected (e.g. the app lacks card
+ * permission on this tenant) — a rendered message is the goal, but a delivered
+ * one matters more.
+ */
 async function sendTextMessage(opts: {
   receiveId: string;
   text: string;
@@ -359,28 +394,43 @@ async function sendTextMessage(opts: {
     const isGroupChat = idType === 'chat_id';
     // Resolve dynamically so it always reflects the latest message sender
     const mentionId = opts.mentionUserId || (isGroupChat ? resolveAuthorId() : '');
-    const textWithMention = mentionId
-      ? `<at user_id="${mentionId}"></at> ${opts.text}`
-      : opts.text;
 
-    const res = await fetch(
-      `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${idType}`,
-      {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          receive_id: opts.receiveId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: textWithMention }),
-        }),
-      }
-    );
-    const json = await res.json() as { code: number; msg?: string; data?: { message_id?: string } };
-    return {
-      success: json.code === 0,
-      messageId: json.data?.message_id,
-      error: json.code !== 0 ? `${json.code}: ${json.msg ?? ''}` : undefined,
+    const card = {
+      schema: '2.0',
+      config: { wide_screen_mode: true },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: mentionId ? `<at id=${mentionId}></at> ${opts.text}` : opts.text,
+          },
+        ],
+      },
     };
+
+    let json = await postMessage(token, idType, {
+      receive_id: opts.receiveId,
+      msg_type: 'interactive',
+      content: JSON.stringify(card),
+    });
+
+    if (json.code !== 0) {
+      const cardError = `${json.code}: ${json.msg ?? ''}`;
+      const textWithMention = mentionId
+        ? `<at user_id="${mentionId}"></at> ${opts.text}`
+        : opts.text;
+      json = await postMessage(token, idType, {
+        receive_id: opts.receiveId,
+        msg_type: 'text',
+        content: JSON.stringify({ text: textWithMention }),
+      });
+      if (json.code !== 0) {
+        return { success: false, error: `card send failed (${cardError}); text fallback failed (${json.code}: ${json.msg ?? ''})` };
+      }
+      return { success: true, messageId: json.data?.message_id };
+    }
+
+    return { success: true, messageId: json.data?.message_id };
   } catch (err) {
     return { success: false, error: `Exception: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -893,7 +943,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'feishu_send_message',
       description:
-        'Send a text message to a Feishu chat or user. When sending to a group chat (receive_id starts with "oc_"), always pass mention_user_id so the recipient gets @mentioned. In group chats, each user message starts with their open_id as a prefix (e.g. "ou_xxx: message") — extract that open_id and pass it as mention_user_id.',
+        'Send a message to a Feishu chat or user, delivered as a rendered-Markdown card — headings, bold, lists, tables, code fences and links all display formatted, so write normal Markdown rather than flattening it to plain text. When sending to a group chat (receive_id starts with "oc_"), always pass mention_user_id so the recipient gets @mentioned. In group chats, each user message starts with their open_id as a prefix (e.g. "ou_xxx: message") — extract that open_id and pass it as mention_user_id.',
       inputSchema: {
         type: 'object' as const,
         required: ['text'],

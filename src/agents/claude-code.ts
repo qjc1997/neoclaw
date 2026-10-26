@@ -23,6 +23,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { McpServerConfig } from '../config.js';
 import { loadConfig } from '../config.js';
+import { formatBackendError, isAuthErrorText } from '../utils/backend-errors.js';
 import { createDebouncedFlush } from '../utils/debounced-flush.js';
 import { logger } from '../utils/logger.js';
 import { Mutex } from '../utils/mutex.js';
@@ -33,6 +34,7 @@ import type {
   Attachment,
   RunRequest,
   RunResponse,
+  UnsolicitedHandler,
 } from './types.js';
 
 const log = logger('claude-code');
@@ -57,6 +59,9 @@ type ImageBlock = {
 };
 type UserInput = {
   type: 'user';
+  uuid: string;
+  session_id: string;
+  parent_tool_use_id: null;
   message: { role: 'user'; content: string | Array<TextBlock | ImageBlock> };
 };
 
@@ -116,10 +121,52 @@ type AssistantContentBlock =
   | { type: 'thinking'; thinking: string }
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown };
+type TurnUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+};
 type AssistantEvent = {
   type: 'assistant';
-  message: { content: AssistantContentBlock[] };
+  // `usage` is this turn's usage alone — unlike the result event's cumulative
+  // totals, it is a true snapshot of context occupancy for that turn.
+  message: { content: AssistantContentBlock[]; usage?: TurnUsage; model?: string };
 };
+
+/**
+ * Context occupancy for a single assistant turn: everything the model had to
+ * read to produce it (fresh input + newly cached prefix + cache hits).
+ */
+function turnContextTokens(usage: TurnUsage | undefined): number | null {
+  if (!usage) return null;
+  return (
+    (usage.input_tokens ?? 0) +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0)
+  );
+}
+/**
+ * Model that actually served the turn, plus its context window. Prefers the
+ * model observed on the stream (assistant `message.model`, else init event);
+ * `modelUsage` is cumulative across resumes and may list several models (old
+ * model before a /model switch, haiku for subagents), so it's only matched
+ * against the observed model, never trusted by key order.
+ */
+function resolveTurnModel(
+  observed: string | null,
+  r: ResultEvent | null
+): { model: string | null; contextWindow: number | null } {
+  const usage = r?.modelUsage ?? {};
+  const base = (m: string) => m.replace(/\[.*\]$/, '');
+  const key = observed
+    ? Object.keys(usage).find((k) => k === observed || base(k) === base(observed))
+    : Object.keys(usage).at(-1);
+  return {
+    model: observed ?? key ?? r?.model ?? null,
+    contextWindow: (key ? usage[key]?.contextWindow : undefined) ?? null,
+  };
+}
 type PermissionDenial = {
   tool_name: string;
   tool_use_id: string;
@@ -135,9 +182,10 @@ type ResultEvent = {
   total_cost_usd?: number | null;
   cost_usd?: number | null;
   // Current CLI does NOT emit a top-level `model` field on the result event
-  // (only on the init event). The model identity at the time of the result
-  // is available as a key under `modelUsage`. Kept optional here for older
-  // CLI versions that may have had it.
+  // (only on the init event). Kept optional here for older CLI versions that
+  // may have had it. Don't derive the model from `modelUsage` key order: on
+  // --resume the CLI restores the session's cumulative usage, so after a
+  // /model switch the FIRST key is still the old model (see resolveTurnModel).
   model?: string;
   is_error: boolean;
   duration_ms: number | null;
@@ -152,11 +200,9 @@ type ResultEvent = {
     { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }
   >;
   permission_denials?: PermissionDenial[];
-  // Present on results that are the deferred completion of a BACKGROUND task
-  // (subagent finishing after its spawning turn already ended). `kind` is
-  // "task-notification" for these. Such results are NOT the reply to the
-  // prompt the caller just sent — see ClaudeProcess.exchange for why this
-  // distinction prevents a one-message reply drift.
+  // `kind` is "task-notification" when the CLI started the turn itself because
+  // a background task finished. Not used for routing: a user message can be
+  // folded into such a turn, making this result its reply (see exchange()).
   origin?: { kind?: string } | null;
 };
 
@@ -188,7 +234,80 @@ function formatQuestionsAsText(questions: AskQuestion[]): string {
   return lines.join('\n').trim();
 }
 
-type CueEvent = InitEvent | AssistantEvent | ResultEvent;
+/**
+ * Per-message progress emitted by the CLI, keyed by the `uuid` we put on the
+ * stdin message: queued → started → completed. This is the only signal that
+ * reliably ties a turn's output to the message that caused it — a message
+ * written while the CLI is busy gets folded into the running turn and never
+ * gets a result of its own.
+ */
+type LifecycleEvent = {
+  type: 'command_lifecycle';
+  command_uuid: string;
+  state: string;
+};
+/** Echo of a stdin message (needs --replay-user-messages), sent when the CLI begins processing it. */
+type UserEchoEvent = { type: 'user'; uuid?: string; isReplay?: boolean };
+type BackgroundTasksEvent = { type: 'system'; subtype: 'background_tasks_changed'; tasks?: unknown[] };
+
+type CueEvent = InitEvent | AssistantEvent | ResultEvent | LifecycleEvent | UserEchoEvent | BackgroundTasksEvent;
+
+/** Output of a turn the CLI started on its own (background task finished) while no message of ours owned it. */
+export type UnsolicitedOutput = { text: string; result: ResultEvent | null; sessionId: string | null; model: string | null };
+
+const QUEUE_TIMEOUT = Symbol('timeout');
+
+/** Single-consumer async queue fed by the stdout pump. */
+class EventQueue<T> {
+  private _items: T[] = [];
+  private _waiter: ((v: T | null | typeof QUEUE_TIMEOUT) => void) | null = null;
+  private _closed = false;
+
+  push(v: T): void {
+    if (this._closed) return;
+    const w = this._waiter;
+    if (w) {
+      this._waiter = null;
+      w(v);
+    } else {
+      this._items.push(v);
+    }
+  }
+
+  close(): void {
+    this._closed = true;
+    const w = this._waiter;
+    this._waiter = null;
+    w?.(null);
+  }
+
+  next(timeoutMs?: number): Promise<T | null | typeof QUEUE_TIMEOUT> {
+    if (this._items.length > 0) return Promise.resolve(this._items.shift()!);
+    if (this._closed) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const settle = (v: T | null | typeof QUEUE_TIMEOUT) => {
+        if (timer) clearTimeout(timer);
+        resolve(v);
+      };
+      this._waiter = settle;
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          if (this._waiter === settle) {
+            this._waiter = null;
+            resolve(QUEUE_TIMEOUT);
+          }
+        }, timeoutMs);
+      }
+    });
+  }
+}
+
+/**
+ * After one of {our command completed, the turn's result} arrives, how long to
+ * wait for the other. Both normally land within milliseconds of each other.
+ */
+const TURN_END_GRACE_MS = 5000;
 
 function parseCliEvent(line: string): CueEvent | null {
   try {
@@ -208,6 +327,18 @@ class ClaudeProcess {
   private _buffer = '';
   /** Cached terminate() promise so concurrent calls share one teardown. */
   private _terminatePromise: Promise<void> | null = null;
+  /** Set by the stdout pump when it hits EOF (process exited or terminated). */
+  private _eof = false;
+  /** Receives every stdout event while an exchange() is in flight; null when idle. */
+  private _sink: EventQueue<CueEvent> | null = null;
+  /** Text of a CLI-initiated turn (background task finished) not owned by any exchange. */
+  private _idleText: string[] = [];
+  private _idleTurnActive = false;
+  private _backgroundTaskCount = 0;
+  /** Model reported by the CLI (init event, refined by each assistant message). */
+  private _model: string | null = null;
+  /** Last time the CLI wrote anything — keeps the idle reaper off a process doing background work. */
+  lastActivity = Date.now();
 
   constructor(
     private readonly opts: {
@@ -217,15 +348,29 @@ class ClaudeProcess {
       cwd?: string | null;
       resumeSessionId?: string | null;
       extraEnv?: Record<string, string>;
+      onUnsolicited?: (out: UnsolicitedOutput) => void;
     }
   ) {}
 
   get isRunning(): boolean {
-    return this._proc !== null && !this._proc.killed;
+    return this._proc !== null && !this._proc.killed && !this._eof;
+  }
+
+  /** True while the CLI has background tasks or is running a turn nobody asked for. */
+  get hasBackgroundWork(): boolean {
+    return this._backgroundTaskCount > 0 || this._idleTurnActive;
+  }
+
+  get idleTurnActive(): boolean {
+    return this._idleTurnActive;
   }
 
   get sessionId(): string | null {
     return this._sessionId;
+  }
+
+  get model(): string | null {
+    return this._model;
   }
 
   private _buildArgs(): string[] {
@@ -236,6 +381,7 @@ class ClaudeProcess {
       '--output-format',
       'stream-json',
       '--verbose',
+      '--replay-user-messages',
     ];
     if (this.opts.resumeSessionId) args.push('--resume', this.opts.resumeSessionId);
     if (this.opts.model) {
@@ -269,6 +415,12 @@ class ClaudeProcess {
     const env = { ...process.env, ...this.opts.extraEnv };
     delete env['CLAUDECODE'];
     delete env['CLAUDE_CODE_ENTRYPOINT'];
+    // Also strip NEOCLAW_DAEMON. We inherit it from launchd, and leaking it
+    // means a `bun start` an agent runs in its workspace believes it is
+    // already the background child, skips self-daemonizing, and performs the
+    // takeover in the foreground as our descendant — so disposing this agent
+    // during shutdown kills the very daemon meant to replace us.
+    delete env['NEOCLAW_DAEMON'];
 
     this._proc = Bun.spawn(this._buildArgs(), {
       stdin: 'pipe',
@@ -284,55 +436,150 @@ class ClaudeProcess {
       .catch(() => {});
     this._reader = decoder.readable.getReader() as ReadableStreamDefaultReader<string>;
     this._buffer = '';
+    void this._pump();
   }
 
   /**
-   * Send a user message (with optional image attachments) and yield parsed CLI
-   * events until the result arrives.
+   * Sole reader of stdout for the life of the process. The CLI writes output
+   * even when no exchange is waiting (it starts a turn by itself when a
+   * background task finishes), so stdout must be drained continuously rather
+   * than only inside exchange().
+   */
+  private async _pump(): Promise<void> {
+    while (true) {
+      const line = await this._readLine();
+      if (line === null) break;
+      const evt = parseCliEvent(line);
+      if (!evt) continue;
+      this.lastActivity = Date.now();
+
+      if (evt.type === 'system') {
+        const sys = evt as InitEvent | BackgroundTasksEvent;
+        if (sys.subtype === 'init') {
+          this._sessionId = (sys as InitEvent).session_id;
+          this._model = (sys as InitEvent).model || this._model;
+          continue;
+        }
+        if (sys.subtype === 'background_tasks_changed') {
+          this._backgroundTaskCount = (sys as BackgroundTasksEvent).tasks?.length ?? 0;
+        }
+      }
+      if (evt.type === 'assistant' && (evt as AssistantEvent).message?.model) {
+        this._model = (evt as AssistantEvent).message.model!;
+      }
+      if (evt.type === 'result' && (evt as ResultEvent).session_id) {
+        this._sessionId = (evt as ResultEvent).session_id;
+      }
+
+      if (this._sink) this._sink.push(evt);
+      else this._handleIdleEvent(evt);
+    }
+    this._eof = true;
+    this._sink?.close();
+    this._idleTurnActive = false;
+  }
+
+  /** Accumulate a turn the CLI ran on its own; publish it when it ends. */
+  private _handleIdleEvent(evt: CueEvent): void {
+    if (evt.type === 'assistant') {
+      this._idleTurnActive = true;
+      for (const block of (evt as AssistantEvent).message.content) {
+        if (block.type === 'text') this._idleText.push(block.text);
+      }
+    } else if (evt.type === 'result') {
+      this._flushIdle(evt as ResultEvent);
+    }
+  }
+
+  private _flushIdle(result: ResultEvent | null): void {
+    const text = (result?.result || this._idleText.join('')).trim();
+    this._idleText = [];
+    this._idleTurnActive = false;
+    if (!text) return;
+    log.info(`Unsolicited turn output (${text.length} chars)${result ? '' : ' [partial, superseded by a user message]'}`);
+    this.opts.onUnsolicited?.({ text, result, sessionId: this._sessionId, model: this._model });
+  }
+
+  /**
+   * Send a user message and yield the CLI events that belong to it, ending
+   * once the CLI reports that message's turn finished.
+   *
+   * Ownership is decided by the message's uuid, never by counting results:
+   * - events before the CLI starts our message belong to whatever turn was
+   *   already running (typically one triggered by a background task) and are
+   *   routed to the idle handler;
+   * - from `started` (or the replayed echo of our message) on, events are ours;
+   * - we finish when our command is `completed` and the turn's result is in.
+   * A stray result therefore can't end this exchange early or be inherited by
+   * the next one — the failure mode that made replies lag one message behind.
    */
   async *exchange(text: string, attachments?: Attachment[]): AsyncGenerator<CueEvent> {
     await this._mutex.acquire();
+    const queue = new EventQueue<CueEvent>();
+    this._sink = queue;
     try {
       if (!this.isRunning) throw new Error('Process is not running');
 
+      const uuid = crypto.randomUUID();
       const content = buildUserContent(text, attachments);
-      await this._writeln(
-        JSON.stringify({ type: 'user', message: { role: 'user', content } } as UserInput)
-      );
+      const input: UserInput = {
+        type: 'user',
+        uuid,
+        session_id: '',
+        parent_tool_use_id: null,
+        message: { role: 'user', content },
+      };
+      await this._writeln(JSON.stringify(input));
+
+      let started = false;
+      let completed = false;
+      let resultSeen = false;
+      const markStarted = () => {
+        if (started) return;
+        started = true;
+        // Whatever the CLI produced on its own before picking up our message
+        // is a separate answer; publish it now rather than splice it into ours.
+        if (this._idleTurnActive || this._idleText.length > 0) this._flushIdle(null);
+      };
 
       while (true) {
-        const line = await this._readLine();
-        if (line === null) break;
+        const evt = await queue.next(completed || resultSeen ? TURN_END_GRACE_MS : undefined);
+        if (evt === null) break;
+        if (evt === QUEUE_TIMEOUT) {
+          log.warn(`exchange: turn end incomplete after ${TURN_END_GRACE_MS}ms (completed=${completed}, result=${resultSeen}); finishing`);
+          break;
+        }
 
-        const evt = parseCliEvent(line);
-        if (!evt) continue;
-
-        // Capture session ID from init event
-        if (evt.type === 'system' && (evt as InitEvent).subtype === 'init') {
-          this._sessionId = (evt as InitEvent).session_id;
+        if (evt.type === 'command_lifecycle') {
+          const lc = evt as LifecycleEvent;
+          if (lc.command_uuid !== uuid) continue;
+          if (lc.state === 'started') markStarted();
+          if (lc.state === 'completed') {
+            markStarted();
+            completed = true;
+            if (resultSeen) return;
+          }
           continue;
         }
 
-        if (evt.type === 'result') {
-          const r = evt as ResultEvent;
-          if (r.session_id) this._sessionId = r.session_id;
-          yield evt;
-          // A `task-notification` result is the deferred completion of a
-          // background subagent, NOT the reply to the prompt we just wrote.
-          // If we returned here, the NEXT exchange() would consume this stray
-          // result as its answer, drifting every reply one message behind
-          // (the classic "each answer is for the previous question" bug).
-          // Keep reading until the real terminal result for THIS prompt lands.
-          if (r.origin?.kind === 'task-notification') {
-            log.info('exchange: bypassed background task-notification result; awaiting real result');
-            continue;
-          }
-          return;
+        if (evt.type === 'user' && (evt as UserEchoEvent).isReplay) {
+          if ((evt as UserEchoEvent).uuid === uuid) markStarted();
+          continue;
+        }
+
+        if (!started) {
+          this._handleIdleEvent(evt);
+          continue;
         }
 
         yield evt;
+        if (evt.type === 'result') {
+          resultSeen = true;
+          if (completed) return;
+        }
       }
     } finally {
+      this._sink = null;
       this._mutex.release();
     }
   }
@@ -352,6 +599,7 @@ class ClaudeProcess {
       this._reader.cancel().catch(() => {});
       this._reader = null;
     }
+    this._sink?.close();
 
     if (this.isRunning) {
       try {
@@ -425,6 +673,7 @@ export class ClaudeCodeAgent implements Agent {
   /** Persists session IDs so processes can be resumed after idle reap or daemon restart. */
   private _sessionIds = new Map<string, string>();
   private _cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private _unsolicitedHandler: UnsolicitedHandler | null = null;
   private _flushSessions = createDebouncedFlush(() => {
     try {
       const dir = join(homedir(), '.neoclaw', 'cache');
@@ -498,6 +747,46 @@ export class ClaudeCodeAgent implements Agent {
     return this._modelOverrides.get(conversationId) ?? this.opts.model ?? null;
   }
 
+  setUnsolicitedHandler(handler: UnsolicitedHandler | null): void {
+    this._unsolicitedHandler = handler;
+  }
+
+  private _publishUnsolicited(
+    conversationId: string,
+    chatId: string,
+    gatewayKind: string,
+    out: UnsolicitedOutput
+  ): void {
+    if (out.sessionId) {
+      this._sessionIds.set(conversationId, out.sessionId);
+      this._flushSessions();
+    }
+    this._lastUsed.set(conversationId, Date.now());
+    if (!this._unsolicitedHandler) {
+      log.warn(`Unsolicited output for "${conversationId}" dropped: no handler`);
+      return;
+    }
+    const r = out.result;
+    const { model, contextWindow } = resolveTurnModel(out.model, r);
+    this._unsolicitedHandler({
+      conversationId,
+      chatId,
+      gatewayKind,
+      response: {
+        text: r?.is_error ? formatBackendError(out.text, '') : out.text,
+        thinking: null,
+        sessionId: out.sessionId,
+        costUsd: r?.total_cost_usd ?? r?.cost_usd ?? null,
+        inputTokens: turnContextTokens(r?.usage),
+        outputTokens: r?.usage?.output_tokens ?? null,
+        elapsedMs: r?.duration_ms ?? null,
+        isError: r?.is_error === true,
+        model,
+        contextWindow,
+      },
+    });
+  }
+
   // ── Agent interface ───────────────────────────────────────
 
   async run(request: RunRequest): Promise<RunResponse> {
@@ -523,6 +812,10 @@ export class ClaudeCodeAgent implements Agent {
     const textParts: string[] = [];
     const thinkingParts: string[] = [];
     let resultEvt: ResultEvent | null = null;
+    // Context occupancy is a snapshot, not a sum: keep only the LAST assistant
+    // turn's usage. The result event's totals accumulate one cache-read per
+    // internal turn, which is why they used to report ">100% of the window".
+    let lastTurnContextTokens: number | null = null;
 
     const proc = await this._getOrCreate(request);
 
@@ -536,7 +829,10 @@ export class ClaudeCodeAgent implements Agent {
         this._lastUsed.set(request.conversationId, Date.now());
         if (evt.type === 'assistant') {
           // CLI outputs full assistant message events (not incremental deltas)
-          const blocks = (evt as AssistantEvent).message.content;
+          const msg = (evt as AssistantEvent).message;
+          const turnTokens = turnContextTokens(msg.usage);
+          if (turnTokens !== null) lastTurnContextTokens = turnTokens;
+          const blocks = msg.content;
           for (const block of blocks) {
             if (block.type === 'thinking') {
               thinkingParts.push(block.thinking);
@@ -549,18 +845,7 @@ export class ClaudeCodeAgent implements Agent {
             }
           }
         } else if (evt.type === 'result') {
-          const r = evt as ResultEvent;
-          if (r.origin?.kind === 'task-notification') {
-            // Deferred background-subagent output. Surface its text in-band so
-            // it isn't lost, but it is NOT this turn's terminal result — that
-            // still comes from the prompt we sent (see ClaudeProcess.exchange).
-            if (r.result) {
-              textParts.push(r.result);
-              yield { type: 'text_delta', text: r.result };
-            }
-          } else {
-            resultEvt = r;
-          }
+          resultEvt = evt as ResultEvent;
         }
       }
     } finally {
@@ -573,7 +858,23 @@ export class ClaudeCodeAgent implements Agent {
       this._flushSessions();
     }
 
-    const baseText = resultEvt?.result || textParts.join('');
+    // A failed turn arrives as an ordinary result event carrying `is_error`,
+    // with the CLI's message in `result`. Reading only `result` (as this did)
+    // relays backend failures to the user as if the assistant had written
+    // them — see utils/backend-errors.ts.
+    const isError = resultEvt?.is_error === true;
+    const partialText = textParts.join('');
+    const baseText = resultEvt?.result || partialText;
+
+    // An auth failure poisons the subprocess for the rest of its life: it
+    // holds the credentials it read at spawn, so every later turn fails
+    // instantly (~135ms, zero tokens) without re-reading the refreshed token.
+    // Drop it so the next turn respawns and resumes on fresh credentials.
+    if (isError && isAuthErrorText(baseText)) {
+      log.error(`Auth failure for conversation "${request.conversationId}" — discarding subprocess so the next turn re-reads credentials`);
+      await this._discardProcess(request.conversationId);
+    }
+
     const askQuestions = resultEvt ? extractAskQuestions(resultEvt) : null;
     // Yield ask_questions BEFORE done so the streaming card is still open when the gateway appends the form
     if (askQuestions && askQuestions.length > 0) {
@@ -583,25 +884,18 @@ export class ClaudeCodeAgent implements Agent {
         conversationId: request.conversationId,
       };
     }
-    const text = baseText;
+    const text = isError ? formatBackendError(baseText, partialText) : baseText;
     const thinking = thinkingParts.length > 0 ? thinkingParts.join('') : null;
 
     log.info(`Run done: ${JSON.stringify({ text, thinking, resultEvt })}`);
 
-    // Compute total input tokens (includes cache hits)
+    // Total BILLED input tokens across every internal turn (includes cache
+    // hits). This is a cost figure — see RunResponse.inputTokens for why it
+    // must not be compared against the context window.
     const usage = resultEvt?.usage;
-    const totalInputTokens =
-      usage
-        ? (usage.input_tokens ?? 0) +
-          (usage.cache_creation_input_tokens ?? 0) +
-          (usage.cache_read_input_tokens ?? 0)
-        : null;
+    const totalInputTokens = turnContextTokens(usage);
 
-    // Extract contextWindow from modelUsage (first model entry)
-    const modelUsage = resultEvt?.modelUsage;
-    const contextWindow = modelUsage
-      ? Object.values(modelUsage)[0]?.contextWindow ?? null
-      : null;
+    const { model, contextWindow } = resolveTurnModel(proc.model, resultEvt);
 
     yield {
       type: 'done',
@@ -613,12 +907,9 @@ export class ClaudeCodeAgent implements Agent {
         inputTokens: totalInputTokens,
         outputTokens: usage?.output_tokens ?? null,
         elapsedMs: Date.now() - t0,
-        // model identity lives under modelUsage keys in current CLI; older
-        // CLI versions had a top-level `model` field, fall back to that.
-        model:
-          (resultEvt?.modelUsage ? Object.keys(resultEvt.modelUsage)[0] : undefined)
-          ?? resultEvt?.model
-          ?? null,
+        contextTokens: lastTurnContextTokens,
+        isError,
+        model,
         contextWindow,
       },
     };
@@ -631,6 +922,20 @@ export class ClaudeCodeAgent implements Agent {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Terminate and unpool a conversation's subprocess WITHOUT clearing its
+   * session ID, so the next turn respawns with `--resume <sessionId>` and
+   * keeps the conversation's context. Used to shed a process whose in-memory
+   * state has gone bad (e.g. credentials it can no longer refresh).
+   */
+  private async _discardProcess(conversationId: string): Promise<void> {
+    const proc = this._pool.get(conversationId);
+    if (!proc) return;
+    this._pool.delete(conversationId);
+    this._lastUsed.delete(conversationId);
+    await proc.terminate().catch((e) => log.warn(`Discard terminate failed: ${e}`));
   }
 
   async clearConversation(conversationId: string): Promise<void> {
@@ -646,16 +951,23 @@ export class ClaudeCodeAgent implements Agent {
   }
 
   async cancel(conversationId: string): Promise<boolean> {
-    // Only an in-flight streaming response is a valid cancel target. An idle
-    // pooled subprocess waiting for the next message isn't "running" in the
-    // sense /stop intends — killing it would misleadingly say "Stopped" when
-    // nothing was happening, and force a cold start on the next message.
-    if (!this._active.has(conversationId)) return false;
+    // Only an in-flight response (ours, or a turn the CLI started for a
+    // finished background task) is a valid cancel target. An idle pooled
+    // subprocess waiting for the next message isn't "running" in the sense
+    // /stop intends — killing it would misleadingly say "Stopped" when nothing
+    // was happening, and force a cold start on the next message.
     const proc = this._pool.get(conversationId);
     if (!proc) return false;
+    if (!this._active.has(conversationId) && !proc.idleTurnActive) return false;
     await proc.terminate();
-    this._pool.delete(conversationId);
-    this._lastUsed.delete(conversationId);
+    // terminate() can take seconds; meanwhile the dispatcher may already have
+    // drained a queued message into a NEW process for this conversation. Only
+    // evict the process we killed — dropping the new one would orphan it (no
+    // reaping, and the next message would spawn a second CLI on the same session).
+    if (this._pool.get(conversationId) === proc) {
+      this._pool.delete(conversationId);
+      this._lastUsed.delete(conversationId);
+    }
     // _active cleanup is handled by stream()'s finally: terminate() closes the
     // subprocess stdout → _readLine returns null → exchange() loop exits →
     // stream()'s try/finally deletes from _active.
@@ -883,6 +1195,7 @@ export class ClaudeCodeAgent implements Agent {
       systemPrompt: this.opts.systemPrompt ?? null,
       cwd: this._conversationCwd(conversationId, request.authorId),
       resumeSessionId,
+      onUnsolicited: (out) => this._publishUnsolicited(conversationId, chatId, gatewayKind, out),
       // Inject routing context so CLI tools (e.g. neoclaw-cron) know the current chat
       extraEnv: {
         NEOCLAW_CHAT_ID: chatId,
@@ -907,6 +1220,12 @@ export class ClaudeCodeAgent implements Agent {
     return proc;
   }
 
+  /** Reaping would drop the result of a still-running background task. */
+  private _busyInBackground(id: string, cutoff: number): boolean {
+    const proc = this._pool.get(id);
+    return !!proc && (proc.hasBackgroundWork || proc.lastActivity >= cutoff);
+  }
+
   private _scheduleCleanup(): void {
     if (this._cleanupTimer) return;
     this._cleanupTimer = setInterval(() => this._reapIdleProcesses(), CLEANUP_INTERVAL_MS);
@@ -919,7 +1238,7 @@ export class ClaudeCodeAgent implements Agent {
       // Skip conversations with an in-flight stream — reaping them would kill
       // the subprocess mid-response, producing a truncated reply with no
       // result event and losing the updated session_id.
-      .filter(([id, ts]) => ts < cutoff && !this._active.has(id))
+      .filter(([id, ts]) => ts < cutoff && !this._active.has(id) && !this._busyInBackground(id, cutoff))
       .map(([id]) => id);
 
     for (const id of stale) {
@@ -932,7 +1251,7 @@ export class ClaudeCodeAgent implements Agent {
       // Also re-check _lastUsed: _getOrCreate bumps it for existing procs, so
       // a fresh timestamp means the conversation is live even if we haven't
       // yet observed _active.add (tiny microtask window between the two).
-      if (this._active.has(id)) continue;
+      if (this._active.has(id) || this._busyInBackground(id, cutoff)) continue;
       const lastUsed = this._lastUsed.get(id);
       if (lastUsed !== undefined && lastUsed >= cutoff) continue;
       log.info(`Reaping idle process for conversation "${id}"`);

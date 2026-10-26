@@ -42,6 +42,7 @@ import {
   sendMarkdown,
   STREAM_EL,
   updateCardText,
+  updateChatName,
   updatePanelHeader,
   updateStepText,
 } from './sender.js';
@@ -95,6 +96,11 @@ export class FeishuGateway implements Gateway {
       this._wsClient = null;
     }
     log.info('Feishu gateway stopped');
+  }
+
+  /** Rename a group chat (best-effort, silently ignores errors). */
+  async setChatName(chatId: string, name: string): Promise<void> {
+    await updateChatName(this._httpClient(), chatId, name);
   }
 
   /** Proactively send a message to a chat (e.g. restart notifications). */
@@ -331,6 +337,12 @@ export class FeishuGateway implements Gateway {
     let currentThinkingId: string | null = null;
     let currentThinkingText = '';
     let thinkingSegmentCount = 0;
+    // Feishu rejects cards past ~200 elements (code 300305), after which every
+    // later step fails. Beyond the cap, one summary element is updated instead.
+    const MAX_PANEL_STEPS = 120;
+    const OVERFLOW_ID = 'steps_overflow';
+    let overflowAdded = false;
+    let thinkingHidden = false;
     let lastStepId = ''; // Tracks last element in panel for insert_after
     let seq = 1;
     let lastThinkingFlush = 0;
@@ -366,6 +378,22 @@ export class FeishuGateway implements Gateway {
       lastStepId = stepId;
     };
 
+    // Past the cap: show "+N more · latest step" in a single reused element.
+    const noteOverflow = async (id: string, latest: string): Promise<void> => {
+      const hidden = stepCount - MAX_PANEL_STEPS;
+      const text = `+${hidden} more ${hidden === 1 ? 'step' : 'steps'}${latest ? ` · latest: ${latest}` : ''}`;
+      if (!overflowAdded) {
+        overflowAdded = true;
+        await addStep(id, buildStepDiv(text, 'more_outlined', OVERFLOW_ID), OVERFLOW_ID).catch((e) =>
+          log.warn(`addStep (overflow) failed: ${e}`)
+        );
+      } else {
+        await updateStepText(client, id, OVERFLOW_ID, text, seq++).catch((e) =>
+          log.warn(`overflow update failed: ${e}`)
+        );
+      }
+    };
+
     // Update panel header with current step count.
     const refreshPanelHeader = async (id: string, label: string): Promise<void> => {
       const countText = stepCount + ' ' + (stepCount === 1 ? 'step' : 'steps');
@@ -383,6 +411,10 @@ export class FeishuGateway implements Gateway {
       currentThinkingId = null;
       currentThinkingText = '';
     };
+    const endThinkingSegment = async (id: string): Promise<void> => {
+      thinkingHidden = false;
+      await finalizeThinking(id);
+    };
 
     try {
       for await (const event of stream) {
@@ -393,7 +425,12 @@ export class FeishuGateway implements Gateway {
           const id = await ensureCard();
 
           // Start a new thinking segment if needed (robot icon DivElement)
-          if (!currentThinkingId) {
+          if (!currentThinkingId && !thinkingHidden && stepCount >= MAX_PANEL_STEPS) {
+            stepCount++;
+            thinkingHidden = true;
+            await noteOverflow(id, 'thinking');
+            await refreshPanelHeader(id, 'Working on it');
+          } else if (!currentThinkingId && !thinkingHidden) {
             thinkingSegmentCount++;
             stepCount++;
             currentThinkingId = `thinking_${thinkingSegmentCount}`;
@@ -405,7 +442,7 @@ export class FeishuGateway implements Gateway {
           }
 
           // Throttled text update for the current thinking DivElement
-          if (now - lastThinkingFlush >= FLUSH_INTERVAL_MS) {
+          if (currentThinkingId && now - lastThinkingFlush >= FLUSH_INTERVAL_MS) {
             await updateStepText(client, id, currentThinkingId, currentThinkingText, seq++).catch(
               (e) => log.warn(`thinking update failed: ${e}`)
             );
@@ -415,20 +452,23 @@ export class FeishuGateway implements Gateway {
           const id = await ensureCard();
 
           // Finalize the preceding thinking segment so tool step appears after it
-          await finalizeThinking(id);
+          await endThinkingSegment(id);
 
           stepCount++;
           const { text, icon } = formatToolStep(event.name, event.input);
-          const stepElementId = `step_${stepCount}`;
-          const stepDiv = buildStepDiv(text, icon, stepElementId);
-
-          await addStep(id, stepDiv, stepElementId).catch((e) =>
-            log.warn(`addStep (tool) failed: ${e}`)
-          );
+          if (stepCount > MAX_PANEL_STEPS) {
+            await noteOverflow(id, text);
+          } else {
+            const stepElementId = `step_${stepCount}`;
+            const stepDiv = buildStepDiv(text, icon, stepElementId);
+            await addStep(id, stepDiv, stepElementId).catch((e) =>
+              log.warn(`addStep (tool) failed: ${e}`)
+            );
+          }
           await refreshPanelHeader(id, 'Working on it');
         } else if (event.type === 'text_delta') {
           const id = await ensureCard();
-          await finalizeThinking(id);
+          await endThinkingSegment(id);
 
           mainText += event.text;
           if (now - lastMainFlush >= FLUSH_INTERVAL_MS) {
@@ -542,7 +582,7 @@ function formatStats(response: RunResponse): string | null {
   if (response.inputTokens != null) parts.push(`${response.inputTokens} in`);
   if (response.outputTokens != null) parts.push(`${response.outputTokens} out`);
   if (response.costUsd != null) parts.push(`$${response.costUsd.toFixed(4)}`);
-  const ctxPct = contextUsagePercent(response.inputTokens, response.contextWindow, response.model);
+  const ctxPct = contextUsagePercent(response.contextTokens, response.contextWindow, response.model);
   if (ctxPct != null) parts.push(`ctx ${ctxPct}%`);
   return parts.length > 0 ? parts.join(' · ') : null;
 }

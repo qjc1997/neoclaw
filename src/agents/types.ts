@@ -44,12 +44,31 @@ export interface RunResponse {
   thinking?: string | null;
   sessionId?: string | null;
   costUsd?: number | null;
+  /**
+   * Total input tokens BILLED for the whole run (all internal turns summed).
+   * Correct for cost accounting; do NOT compare against the context window —
+   * an agentic run re-reads the cached prefix once per turn, so this grows to
+   * many multiples of the window. Use `contextTokens` for that.
+   */
   inputTokens?: number | null;
   outputTokens?: number | null;
   elapsedMs?: number | null;
   model?: string | null;
   /** Model context window size reported by the backend (tokens). */
   contextWindow?: number | null;
+  /**
+   * Live context occupancy after the final assistant turn (tokens). Derived
+   * from that single turn's usage, so it is directly comparable to
+   * `contextWindow`.
+   */
+  contextTokens?: number | null;
+  /**
+   * True when the backend reported this turn as FAILED. Claude Code signals
+   * this with `is_error` on the result event, whose shape is otherwise
+   * identical to a success — `text` then holds the CLI's error message, not an
+   * assistant reply, and must not be rendered as one.
+   */
+  isError?: boolean;
 }
 
 // ── Streaming event types ─────────────────────────────────────
@@ -70,6 +89,19 @@ export type AgentStreamEvent =
   /** Emitted when Claude Code uses AskUserQuestion and the gateway should render an interactive form. */
   | { type: 'ask_questions'; questions: AskQuestion[]; conversationId: string }
   | { type: 'done'; response: RunResponse };
+
+/**
+ * Output the agent produced without a request — e.g. Claude Code starting a
+ * turn by itself when a background task finishes while nothing is in flight.
+ */
+export interface UnsolicitedMessage {
+  conversationId: string;
+  chatId: string;
+  gatewayKind: string;
+  response: RunResponse;
+}
+
+export type UnsolicitedHandler = (msg: UnsolicitedMessage) => void;
 
 // ── Agent interface ───────────────────────────────────────────
 
@@ -108,6 +140,9 @@ export interface Agent {
 
   /** Get the effective model for a conversation. */
   getModel?(conversationId: string): string | null;
+
+  /** Register where to deliver output that wasn't produced for any request. */
+  setUnsolicitedHandler?(handler: UnsolicitedHandler | null): void;
 
   /** Shut down all background processes managed by this agent. */
   dispose(): Promise<void>;

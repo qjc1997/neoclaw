@@ -14,7 +14,11 @@ export const NEOCLAW_HOME = join(homedir(), '.neoclaw');
 // ── Config schema ─────────────────────────────────────────────
 
 export interface AgentConfig {
-  /** Which agent backend to use. Currently only "claude_code" is supported. */
+  /**
+   * Which agent backend to use.
+   * - "claude_code" (default): Anthropic Claude Code CLI.
+   * - "agy": Google Gemini's Claude-Code-style CLI agent.
+   */
   type: string;
   /** Model override (e.g. "claude-opus-4-5"). Defaults to claude CLI's default. */
   model?: string;
@@ -113,6 +117,27 @@ export interface NeoClawConfig {
   workspacesDir?: string;
   /** Directory containing skill subdirectories. Default: ~/.neoclaw/skills. */
   skillsDir?: string;
+  /**
+   * Reaping of background processes an agent left running in a workspace
+   * (dev servers, watchers) after their parent subprocess was reaped.
+   */
+  orphanReaper?: {
+    /** Default: true. Set false to disable the sweep entirely. */
+    enabled?: boolean;
+    /**
+     * "report" (default) logs candidates without touching them; "kill"
+     * terminates them. Killing is opt-in because a workspace CWD does not
+     * prove a process belongs to that workspace — see utils/orphans.ts.
+     */
+    mode?: 'report' | 'kill';
+    /**
+     * Only consider processes orphaned at least this long, so a server an
+     * agent just started for testing survives. Default: 60.
+     */
+    minAgeMins?: number;
+    /** Sweep interval. Default: 30. */
+    intervalMins?: number;
+  };
   /** Minimum log level to output. Default: "info". */
   logLevel?: 'debug' | 'info' | 'warn' | 'error';
 }
@@ -159,6 +184,14 @@ Your source code is at \`~/PycharmProjects/neoclaw/\`. Only the bot owner may ac
 ## Response Language
 
 Respond in the same language the user writes in. If uncertain, default to the language of the most recent message.
+
+## Long Responses in Feishu
+
+Feishu streaming cards (the typewriter-style reply bubble) display the full content inline only up to ~800 characters; longer content gets collapsed in the message list and requires the user to tap/click to expand — users frequently miss this. The hard API limit is 100,000 characters, so truncation is never the issue, but visibility is.
+
+**Rule**: when your response exceeds ~800 characters (reports, summaries, tables, multi-section analysis), ALSO send it as a standalone \`feishu_send_message\` so it appears as a separate, always-visible message that does not require expanding. The streaming card reply can still exist as the natural conversational response — the extra message is a redundant copy for discoverability.
+
+Exceptions: code blocks, quick answers, one-liners, command output — no need to duplicate these.
 `;
 
 export const DEFAULTS: NeoClawConfig = {
@@ -188,6 +221,7 @@ export const DEFAULTS: NeoClawConfig = {
   mcpServers: {},
   skillsDir: join(NEOCLAW_HOME, 'skills'),
   workspacesDir: join(NEOCLAW_HOME, 'workspaces'),
+  orphanReaper: { enabled: true, mode: 'report', minAgeMins: 60, intervalMins: 30 },
   logLevel: 'info',
 };
 
@@ -262,6 +296,12 @@ export function loadConfig(): NeoClawConfig {
       join(NEOCLAW_HOME, 'workspaces')
     ),
     skillsDir: str('NEOCLAW_SKILLS_DIR', file.skillsDir, join(NEOCLAW_HOME, 'skills')),
+    orphanReaper: {
+      enabled: file.orphanReaper?.enabled ?? true,
+      mode: file.orphanReaper?.mode ?? 'report',
+      minAgeMins: file.orphanReaper?.minAgeMins ?? 60,
+      intervalMins: file.orphanReaper?.intervalMins ?? 30,
+    },
     logLevel: str('NEOCLAW_LOG_LEVEL', file.logLevel, 'info') as NeoClawConfig['logLevel'],
   };
 }

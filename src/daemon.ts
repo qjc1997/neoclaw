@@ -15,7 +15,9 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { AgyAgent } from './agents/agy.js';
 import { ClaudeCodeAgent } from './agents/claude-code.js';
+import type { Agent } from './agents/types.js';
 import type { NeoClawConfig } from './config.js';
 import { loadConfig, NEOCLAW_HOME } from './config.js';
 import { CronScheduler } from './cron/scheduler.js';
@@ -24,6 +26,7 @@ import { FeishuGateway } from './gateway/feishu/gateway.js';
 import { MemoryManager } from './memory/manager.js';
 import { MemoryStore } from './memory/store.js';
 import { initFileLogs, logger, setLogLevel } from './utils/logger.js';
+import { startOrphanSweeper } from './utils/orphans.js';
 
 const log = logger('daemon');
 
@@ -101,6 +104,20 @@ export class NeoClawDaemon {
     // Wait a few seconds for gateways to initialize before sending restart notification
     setTimeout(() => this._sendStartupNotification(this._dispatcher!), 5000);
 
+    // Background processes an agent left in a workspace outlive the subprocess
+    // that spawned them (re-parented to init once it is reaped), so nothing
+    // else in the tree will ever clean them up.
+    const reaperCfg = this.config.orphanReaper ?? {};
+    let stopOrphanSweeper: (() => void) | null = null;
+    if (reaperCfg.enabled !== false) {
+      stopOrphanSweeper = startOrphanSweeper({
+        workspacesRoot: this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
+        minAgeSecs: (reaperCfg.minAgeMins ?? 60) * 60,
+        intervalMs: (reaperCfg.intervalMins ?? 30) * 60_000,
+        mode: reaperCfg.mode ?? 'report',
+      });
+    }
+
     try {
       scheduler.start();
       this._memoryManager?.startPeriodicReindex();
@@ -117,9 +134,18 @@ export class NeoClawDaemon {
       if (!(err instanceof DOMException && err.name === 'AbortError')) throw err;
     } finally {
       this._memoryManager?.stopPeriodicReindex();
+      stopOrphanSweeper?.();
       scheduler.stop();
       await this._dispatcher.stop();
       log.info('NeoClaw daemon stopped.');
+      // Exit explicitly. Every gateway is closed and every agent disposed by
+      // this point, so there is nothing left to serve — but a single stray
+      // timer or socket handle keeping the event loop alive would leave a
+      // process that `ps` and launchd still see as running while it answers
+      // nothing. That deaf zombie also blocks launchd's KeepAlive from
+      // restarting us, so the outage persists until someone SIGKILLs it.
+      // Logging is appendFileSync, so nothing is buffered here.
+      process.exit(0);
     }
   }
 
@@ -248,34 +274,43 @@ export class NeoClawDaemon {
 
   // ── Component assembly ────────────────────────────────────
 
+  /**
+   * Construct the configured agent backend. Claude Code is the default; "agy"
+   * (Google Gemini's Claude-Code-style CLI) is supported as an alternative.
+   * The base system prompt is merged with the neoclaw-cron CLI instructions.
+   */
+  private _createAgents(cfg: NeoClawConfig): Agent[] {
+    const cronPrompt = buildCronCliSystemPrompt();
+    const systemPrompt =
+      [cfg.agent.systemPrompt, cronPrompt].filter(Boolean).join('\n\n') || undefined;
+
+    const claudeAgent = new ClaudeCodeAgent({
+      model: cfg.agent.model,
+      modelOverrides: cfg.agent.modelOverrides,
+      allowedTools: cfg.agent.allowedTools,
+      systemPrompt,
+      cwd: cfg.workspacesDir,
+      mcpServers: cfg.mcpServers,
+      skillsDir: cfg.skillsDir,
+      backendUrl: cfg.agent.backendUrl,
+      backendKey: cfg.agent.backendKey,
+    });
+
+    const agyAgent = new AgyAgent({
+      model: cfg.agent.model,
+      modelOverrides: cfg.agent.modelOverrides,
+      systemPrompt,
+      cwd: cfg.workspacesDir,
+    });
+
+    return [claudeAgent, agyAgent];
+  }
+
   private async _buildDispatcher(): Promise<Dispatcher> {
     const dispatcher = new Dispatcher();
 
-    // Build and register the agent
-    const agentType = this.config.agent.type;
-    if (agentType !== 'claude_code') {
-      log.error(`Unknown agent type: "${agentType}". Currently only "claude_code" is supported.`);
-      throw new Error(
-        `Unknown agent type: "${agentType}". Currently only "claude_code" is supported.`
-      );
-    }
-
-    // Merge base system prompt with cron CLI instructions before constructing the agent.
-    const cronPrompt = buildCronCliSystemPrompt();
-    const systemPrompt =
-      [this.config.agent.systemPrompt, cronPrompt].filter(Boolean).join('\n\n') || undefined;
-
-    const agent = new ClaudeCodeAgent({
-      model: this.config.agent.model,
-      modelOverrides: this.config.agent.modelOverrides,
-      allowedTools: this.config.agent.allowedTools,
-      systemPrompt,
-      cwd: this.config.workspacesDir,
-      mcpServers: this.config.mcpServers,
-      skillsDir: this.config.skillsDir,
-      backendUrl: this.config.agent.backendUrl,
-      backendKey: this.config.agent.backendKey,
-    });
+    // Build and register the agents
+    const agents = this._createAgents(this.config);
 
     // Initialize memory system (used for session summarization and periodic reindex)
     const memoryDir = join(NEOCLAW_HOME, 'memory');
@@ -284,8 +319,10 @@ export class NeoClawDaemon {
     memoryManager.reindex();
     this._memoryManager = memoryManager;
 
-    dispatcher.addAgent(agent);
-    dispatcher.setDefaultAgent('claude_code');
+    for (const agent of agents) {
+      dispatcher.addAgent(agent);
+    }
+    dispatcher.setDefaultAgent(this.config.agent.type === 'agy' ? 'agy' : 'claude_code');
     dispatcher.setWorkspacesDir(this.config.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'));
     dispatcher.setMemoryManager(memoryManager);
     if (this.config.speech) {
@@ -359,20 +396,8 @@ export class NeoClawDaemon {
     // 2. Update log level
     setLogLevel(newConfig.logLevel ?? 'info');
 
-    // 3. Build cron system prompt and create new agent
-    const cronPrompt = buildCronCliSystemPrompt();
-    const systemPrompt =
-      [newConfig.agent.systemPrompt, cronPrompt].filter(Boolean).join('\n\n') || undefined;
-
-    const agent = new ClaudeCodeAgent({
-      model: newConfig.agent.model,
-      modelOverrides: newConfig.agent.modelOverrides,
-      allowedTools: newConfig.agent.allowedTools,
-      systemPrompt,
-      cwd: newConfig.workspacesDir,
-      mcpServers: newConfig.mcpServers,
-      skillsDir: newConfig.skillsDir,
-    });
+    // 3. Create new agents from fresh config
+    const agents = this._createAgents(newConfig);
 
     // 4. Stop old memory system
     this._memoryManager?.stopPeriodicReindex();
@@ -387,8 +412,8 @@ export class NeoClawDaemon {
 
     // 6. Reload dispatcher (disposes old agents, swaps in new ones)
     await this._dispatcher!.reload({
-      agent,
-      defaultAgentKind: 'claude_code',
+      agents,
+      defaultAgentKind: newConfig.agent.type === 'agy' ? 'agy' : 'claude_code',
       workspacesDir: newConfig.workspacesDir ?? join(NEOCLAW_HOME, 'workspaces'),
       memoryManager,
       speechConfig: newConfig.speech,
@@ -410,10 +435,58 @@ export class NeoClawDaemon {
   }
 
   private _hardRestart(info: { chatId: string; gatewayKind: string }): void {
-    log.info('Hard restart requested — forking new process...');
+    log.info('Hard restart requested...');
 
     // Persist notification context so the new process can inform the user
     this._saveRestartNotify(info);
+
+    // Under launchd, let launchd own the handoff. `kickstart -k` terminates
+    // this instance and starts a fresh one from the plist, so the replacement
+    // is never a descendant of whatever triggered the restart. Forking our own
+    // replacement is what produced the 12:07 outage: the new daemon was spawned
+    // inside an agent's process tree and died when we disposed that agent
+    // mid-shutdown, leaving a running-but-deaf process behind.
+    // launchd sets XPC_SERVICE_NAME to the job label for managed processes.
+    const label = process.env['XPC_SERVICE_NAME'];
+    const uid = process.getuid?.();
+    if (label && label !== '0' && uid !== undefined) {
+      const target = `gui/${uid}/${label}`;
+      log.info(`Restarting via launchd: launchctl kickstart -k ${target}`);
+      try {
+        const child = spawn('launchctl', ['kickstart', '-k', target], {
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.on('error', (err) => {
+          log.error(`launchctl kickstart failed to spawn (${err}) — forking instead`);
+          this._forkRestart();
+        });
+        child.on('exit', (code) => {
+          // A successful kickstart terminates us, so this rarely fires. When it
+          // does with a non-zero code the restart did not happen, and we are
+          // still serving — fall back rather than silently doing nothing.
+          if (code !== 0) {
+            log.error(`launchctl kickstart exited ${code} — forking instead`);
+            this._forkRestart();
+          }
+        });
+        child.unref();
+        // launchd delivers SIGTERM; _registerSignals drives the shutdown.
+        return;
+      } catch (err) {
+        log.error(`launchctl kickstart failed (${err}) — forking instead`);
+      }
+    }
+
+    this._forkRestart();
+  }
+
+  /**
+   * Fork a replacement daemon ourselves. Fallback for when we are not managed
+   * by launchd (plain `bun start`, or a kickstart that failed).
+   */
+  private _forkRestart(): void {
+    log.info('Forking new process...');
 
     // Use the real Bun binary saved during initial daemonization — process.execPath
     // inside the daemon may point to a temporary bun-node compatibility shim.

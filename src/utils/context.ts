@@ -39,29 +39,36 @@ export function resolveContextLimit(
 
 /**
  * Calculate context usage percentage (0–100).
+ *
+ * `contextTokens` MUST be a single-turn snapshot of context occupancy (see
+ * RunResponse.contextTokens), never a run-total billed-input figure — an
+ * agentic run re-reads its cached prefix once per internal turn, so the total
+ * reaches many multiples of the window and yields nonsense like "284%".
  */
 export function contextUsagePercent(
-  inputTokens: number | null | undefined,
+  contextTokens: number | null | undefined,
   contextWindow: number | null | undefined,
   model: string | null | undefined
 ): number | null {
-  if (inputTokens == null) return null;
+  if (contextTokens == null) return null;
   const limit = resolveContextLimit(contextWindow, model);
-  return Math.round((inputTokens / limit) * 100);
+  return Math.round((contextTokens / limit) * 100);
 }
 
 /**
  * Build a context warning message if usage exceeds the warning threshold.
  * Returns null if no warning is needed.
+ *
+ * Takes the same single-turn `contextTokens` snapshot as contextUsagePercent.
  */
 export function buildContextWarning(
-  inputTokens: number | null | undefined,
+  contextTokens: number | null | undefined,
   contextWindow: number | null | undefined,
   model: string | null | undefined
 ): string | null {
-  if (inputTokens == null) return null;
+  if (contextTokens == null) return null;
   const limit = resolveContextLimit(contextWindow, model);
-  if (inputTokens < limit * WARNING_RATIO) return null;
-  const pct = Math.round((inputTokens / limit) * 100);
-  return `\n\n---\n⚠️ **上下文使用量已达 ${pct}%（${inputTokens.toLocaleString()}/${limit.toLocaleString()} tokens），建议尽快使用 \`/compress\` 压缩会话。**`;
+  if (contextTokens < limit * WARNING_RATIO) return null;
+  const pct = Math.round((contextTokens / limit) * 100);
+  return `\n\n---\n⚠️ **上下文使用量已达 ${pct}%（${contextTokens.toLocaleString()}/${limit.toLocaleString()} tokens），建议尽快使用 \`/compress\` 压缩会话。**`;
 }

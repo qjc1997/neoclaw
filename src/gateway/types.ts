@@ -85,4 +85,10 @@ export interface Gateway {
    * Unlike reply(), this is not tied to an inbound message.
    */
   send(chatId: string, response: RunResponse): Promise<void>;
+
+  /**
+   * Rename a group chat. Optional — only supported by gateways that allow it
+   * (e.g. Feishu group chats). Silently no-ops if unsupported.
+   */
+  setChatName?(chatId: string, name: string): Promise<void>;
 }

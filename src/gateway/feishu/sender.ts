@@ -628,6 +628,27 @@ export function buildQuestionFormElements(opts: {
   ];
 }
 
+/** Rename a group chat. Silently ignores errors (e.g. p2p chats, permission issues). */
+export async function updateChatName(
+  client: Lark.Client,
+  chatId: string,
+  name: string
+): Promise<void> {
+  try {
+    await (
+      client as unknown as {
+        request: (opts: { method: string; url: string; data: object }) => Promise<Record<string, unknown>>;
+      }
+    ).request({
+      method: 'PUT',
+      url: `/open-apis/im/v1/chats/${chatId}`,
+      data: { name },
+    });
+  } catch {
+    // Non-critical — p2p chats and permission errors are silently ignored
+  }
+}
+
 /** Remove an emoji reaction from a message. Silently ignores errors. */
 export async function removeReaction(
   client: Lark.Client,

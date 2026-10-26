@@ -65,7 +65,13 @@ The `stream()` method on `ClaudeCodeAgent` yields `AgentStreamEvent`s: `thinking
 
 **Session isolation**: Thread messages use key `${chatId}:thread:${threadId}` so threads don't share context with the main chat.
 
-**Daemon** (`daemon.ts`): Self-daemonizes on first launch (forks to background with `NEOCLAW_DAEMON=1` env var, redirects I/O to `~/.neoclaw/logs/neoclaw.log`). Uses PID file (`~/.neoclaw/cache/neoclaw.pid`) with SIGTERM takeover of existing instance (up to 10s grace, then SIGKILL). `/restart` command saves `~/.neoclaw/cache/restart-notify.json` (contains `{ chatId, gatewayKind }`), forks a new process, then aborts the current one; new process waits 5s for gateways to initialize, then delivers restart confirmation via `dispatcher.sendTo()` (retries up to 3 times with 3s delay).
+**Daemon** (`daemon.ts`): Self-daemonizes on first launch (forks to background with `NEOCLAW_DAEMON=1` env var, redirects I/O to `~/.neoclaw/logs/neoclaw.log`). Uses PID file (`~/.neoclaw/cache/neoclaw.pid`) with SIGTERM takeover of existing instance (up to 5s grace, then SIGKILL). Shutdown ends with an explicit `process.exit(0)` — **do not remove it**: once the gateways are closed a lingering timer or socket handle would leave a process that `ps` and launchd still consider alive but that answers nothing, which also blocks launchd `KeepAlive` from restarting it. Also starts the **orphan sweeper** (`utils/orphans.ts`).
+
+`/restart` saves `~/.neoclaw/cache/restart-notify.json` (contains `{ chatId, gatewayKind }`). When running under launchd (detected via `XPC_SERVICE_NAME`, which holds the job label) it restarts with `launchctl kickstart -k gui/<uid>/<label>` so **launchd owns the handoff** and the replacement is never a descendant of whatever asked for the restart; otherwise it falls back to `_forkRestart()`, which forks a detached replacement and aborts the current process. The new process waits 5s for gateways to initialize, then delivers restart confirmation via `dispatcher.sendTo()` (retries up to 3 times with 3s delay).
+
+**Never restart the daemon by running `bun start` from an agent workspace.** Agent subprocesses inherit the daemon's environment, so `NEOCLAW_DAEMON` is stripped in `ClaudeCodeAgent.start()` and `AgyAgent` (`delete env['NEOCLAW_DAEMON']`) — without that, the spawned process believes it is already the background child, skips self-daemonizing, and runs the takeover in the foreground as a descendant of the agent. Disposing that agent mid-shutdown then kills the replacement, leaving the old process running with its gateways torn down. Use `launchctl kickstart -k gui/<uid>/dev.orthogonal.neoclaw` or the `/restart` command instead.
+
+**Orphan sweeper** (`utils/orphans.ts`): Background processes an agent starts from a workspace (`vite`, watchers) are children of the Claude Code subprocess; when the pool reaps that subprocess on idle timeout they are re-parented to init and survive indefinitely — nothing else cleans them up. The sweeper lists PPID-1 processes whose CWD is under `workspacesDir` and which are older than `minAgeMins`. **A workspace CWD is not proof of ownership**: an agent that ran `colima start` in a workspace leaves the host's whole Docker VM orphaned under that path, so `PROTECTED_PATTERNS` excludes limactl/colima/docker/ssh/dns-sd, and the default `mode` is `report` (log only). Set `mode: "kill"` to reap automatically.
 
 **Config** (`config.ts`): Loaded from env vars > `~/.neoclaw/config.json` > defaults. Env var prefix: `NEOCLAW_*` for agent/runtime, `FEISHU_*` for Feishu credentials.
 
@@ -97,6 +103,12 @@ Key config fields (`~/.neoclaw/config.json`):
     }
   },
   "skillsDir": "~/.neoclaw/skills", // skill directories (each with SKILL.md)
+  "orphanReaper": {               // background procs agents leave behind in workspaces
+    "enabled": true,
+    "mode": "report",             // "report" (log only, default) | "kill"
+    "minAgeMins": 60,             // ignore processes orphaned more recently than this
+    "intervalMins": 30
+  },
   "logLevel": "info",             // "debug" | "info" | "warn" | "error"
   "workspacesDir": "~/.neoclaw/workspaces"  // base dir; per-conversation subdirs created on demand
 }
